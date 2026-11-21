@@ -1,4 +1,4 @@
-# SETUP (සිංහල) — AnantPlay සිංහල උපසිරැසි පාලම v2.1
+# SETUP (සිංහල) — AnantPlay උපසිරැසි පාලම v4.1 (භාෂා 18) + LAN v2.1
 
 මෙය AnantPlay එක **කැපගසා නොවී** (zero-fork) සිංහල උපසිරැසි ලබා දෙන පාලමයි. v1 හි තිබූ
 මාරාන්තික දෝෂය (ExoPlayer එකට `.srt` ලැබුණේ HTTP 404 ලෙස) මෙයින් නිවැරදි කර ඇත: සෑම
@@ -33,6 +33,46 @@ npx wrangler kv namespace create SUBS_KV     # id එකක් print වේ
 `npx wrangler deploy` කරන්න. `SUBS_KV` නැතත් worker crash වන්නේ නැහැ — cache එක භාවිත කරයි.
 
 පාලම දැන් `https://anantplay-si-subs-bridge.<ඔබේ-වසම>.workers.dev/` හි සජීවීයි.
+
+### 2b · v4.1 — භාෂා 18, දෙ-අදියර සිනමා පිරිපහදුව, සැපයුම්කරු failover
+
+**මුලින්ම KV bind කරන්න** — එය ස්ථිර පරිවර්තන cache එක සහ නැවත ආරම්භ කළ හැකි polish store එකයි:
+
+```bash
+npx wrangler kv namespace create SUBS_KV     # id = "…" print වේ
+# එම id එක wrangler.toml හි [[kv_namespaces]] binding = "SUBS_KV" වෙත paste කරන්න
+```
+
+**එක් සැපයුම්කරුවෙකුට එක් නීත්‍යානුකූල key එකක්** (configure නොකළ සැපයුම්කරුවන් ස්වයංක්‍රීයව මඟ හැරේ):
+
+```bash
+npx wrangler secret put AZURE_TRANSLATOR_KEY     # Azure Translator F0 — මසකට අක්ෂර මිලියන 2 නොමිලේ (ප්‍රධාන එන්ජිම)
+npx wrangler secret put AZURE_TRANSLATOR_REGION  # අවශ්‍ය නම් පමණි (default global)
+npx wrangler secret put GOOGLE_V3_KEY            # Google Cloud Translation — මසකට අක්ෂර 500,000 නොමිලේ
+npx wrangler secret put GEMINI_API_KEY           # Gemini නොමිලේ tier — සිනමා polish LLM
+npx wrangler secret put SUBDL_API_KEY            # අවශ්‍ය නම් පමණි (මිනිස් උපසිරැසි සැපයුම්කරු)
+npx wrangler deploy
+```
+
+**translate-pa (අමතර වේගවත් කරන්නා) — default ලෙස OFF** (ලේඛනගත නොකළ Google endpoint එකකි; එය
+වැසී ගියත් විනාඩි 10 circuit breaker එක හරස් කර chain එක ඊළඟ සැපයුම්කරුට මාරු වේ):
+
+```bash
+npx wrangler secret put TRANSLATE_PA_KEY    # හෝ TRANSLATE_PA_KEY_HEAD / TRANSLATE_PA_KEY_TAIL vars
+# wrangler.toml → [vars] ENABLE_TRANSLATE_PA = "true"   ඉන්පසු: npx wrangler deploy
+```
+
+**වෙනත් භාෂාවක් ඉල්ලන්න**: සෑම endpoint එකක්ම `?lang=` (`si ta hi en es fr ja ko zh-CN ar ur de ru pt
+th id tr vi`) සහ `?register=auto|spoken|formal` ගනී (`auto` — ප්‍රභේදය අනුව; Epic/History/War → formal).
+`si` සඳහා පැරණි v4 job id ආකෘතියම රැඳේ, එබැවින් පවතින installs වෙනසක් නැතිව වැඩ කරයි.
+
+**දෙ-අදියර බෙදාහැරීම**: මූලික NMT `.srt` එක වහාම play කළ හැක (`X-Sub-Quality: base-nmt`,
+`X-Polish-Status: pending`); ඉන්පසු සිනමා polish එක **එකම** `/sub/<token>.srt` token එක තුළම
+උපසිරැසිය ප්‍රතිස්ථාපනය කරයි (`X-Polish-Status: done`). Polish එක අසාර්ථක වුවත් publish වූ මූලික
+ගොනුවට හානියක් නැහැ — එය `base-nmt` ලෙසම රැඳී, ධාවකය දිගටම වැඩ කරයි.
+
+**KV නැත්නම්?** Crash වන්නේ නැහැ: `/health` එක `status: "degraded"` ලෙසත්, `/api/status` එක
+`wrangler kv namespace create SUBS_KV` යන නිවැරදි විසඳුම නම් කරන `storageWarn` එකක් සමඟත් පිළිතුරු දෙයි.
 
 ### 3 · තත්පර 30කින් පරීක්ෂා කරන්න
 ```bash
@@ -140,6 +180,9 @@ git apply /path/to/pr-patch/02-local-srt-picker.patch
 
 | රෝග ලක්ෂණය | ප්‍රතිකාරය |
 | --- | --- |
+| `/health` එක `status: "degraded"` කියයි | `SUBS_KV` bind කර නැහැ — නිවැරදි විසඳුම `/api/status` හි `storageWarn` තුළ ඇත. `npx wrangler kv namespace create SUBS_KV` ධාවනය කර id එක `wrangler.toml` වෙත paste කර නැවත deploy කරන්න. |
+| `X-Polish-Status: pending` / `failed` | මූලික NMT උපසිරැසිය සම්පූර්ණයි, play කළ හැක. සිනමා polish පමණක් රැඳී ඇත (නැවත ආරම්භ කළ හැක) හෝ LLM key/quota මදි. `GEMINI_API_KEY` (හෝ `[ai]` Workers AI binding) පරීක්ෂා කරන්න. |
+| භාෂාවක් `si` job එකට වැටෙනවා | `?lang=` අගය registry codes 18න් එකක් විය යුතුය (`zh-CN`, `zh` නොවේ); නොදන්නා code එකක් හිතාමතාම සිංහල/v4 හැසිරීමට වැටේ. |
 | `/api/*` "no storage" කියයි | KV bind කරන්න (`npx wrangler kv namespace create SUBS_KV`) හෝ Cache API ඇති zone එකකට deploy කරන්න. `workers.dev` deploy එකට cache ඇත — මෙය දකින්නේ විශේෂ අවස්ථාවකදීය |
 | උපසිරැසි ගැලපෙන්නේ නැහැ | ධාරාව අතහැර දෙන්නට කලින් පාලමේ **URL එක fetch කරන්න** බොත්තම ඔබන්න (Sniffer එකට ඇත්ත request එක පෙනෙන්න) |
 | "upstream host not allowlisted" | එම මූලාශ්‍රය සහාය දක්වන ලැයිස්තුවේ නැහැ; `.srt` එක බාගත කර Upload කරන්න, නැත්නම් `ALLOWED_SUB_HOSTS` වලින් host එක එකතු කරන්න |

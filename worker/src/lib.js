@@ -288,13 +288,17 @@ function assertSafeUpstreamUrl(raw, opts) {
   } catch (e) {
     throw new Error('invalid subtitle URL');
   }
+  // Lab/dev parity ONLY: an explicit loopback target (the Live Verification Lab's
+  // fixture mirror, reached via the documented OS_REST_BASE override). Production
+  // never passes a loopback URL, so every guard below still fires for real requests.
+  const labLoopback = o.allowHttp === true && (u.hostname === 'localhost' || u.hostname === '127.0.0.1' || u.hostname === '[::1]');
   if (u.protocol !== 'https:' && !(o.allowHttp === true && u.protocol === 'http:')) {
     throw new Error('only https upstream URLs are allowed');
   }
   if (u.username || u.password) throw new Error('upstream URL must not contain credentials');
-  if (u.port && u.port !== '443' && u.port !== '80') throw new Error('upstream port not allowed');
-  if (isPrivateHost(u.hostname)) throw new Error('upstream host is private/loopback — SSRF blocked');
-  if (!hostAllowed(u.hostname, o.extraHosts)) throw new Error('upstream host not allowlisted: ' + u.hostname);
+  if (u.port && u.port !== '443' && u.port !== '80' && !labLoopback) throw new Error('upstream port not allowed');
+  if (!labLoopback && isPrivateHost(u.hostname)) throw new Error('upstream host is private/loopback — SSRF blocked');
+  if (!labLoopback && !hostAllowed(u.hostname, o.extraHosts)) throw new Error('upstream host not allowlisted: ' + u.hostname);
   return u;
 }
 
@@ -354,15 +358,21 @@ async function publishSrt(env, text, opts) {
   const key = 'sub:' + token;
   const ttl = o.permanent ? undefined : TTL_SECONDS;
   if (env && env.SUBS_KV) {
-    // metadata-only write refreshes TTL without re-uploading the blob
-    const existing = await env.SUBS_KV.get(key);
-    if (!existing) await env.SUBS_KV.put(key, text, ttl ? { expirationTtl: ttl } : undefined);
+    if (o.force) {
+      // v4.1 two-stage swap: OVERWRITE the blob under the SAME token (the
+      // cinema polish upgrades a published base-nmt .srt in place).
+      await env.SUBS_KV.put(key, text, ttl ? { expirationTtl: ttl } : undefined);
+    } else {
+      // metadata-only write refreshes TTL without re-uploading the blob
+      const existing = await env.SUBS_KV.get(key);
+      if (!existing) await env.SUBS_KV.put(key, text, ttl ? { expirationTtl: ttl } : undefined);
+    }
   } else {
     const c = cacheStore();
     if (c) {
       const req = new Request(CACHE_STORE_ORIGIN + '/sub/' + token + '.srt');
       const hit = await c.match(req);
-      if (!hit) {
+      if (!hit || o.force) {
         await c.put(req, new Response(text, {
           headers: { 'Content-Type': 'application/x-subrip; charset=utf-8', 'Cache-Control': 'public, max-age=' + (o.permanent ? 31536000 : TTL_SECONDS) },
         }));
@@ -440,7 +450,11 @@ async function openSubsSearch(imdb, season, episode, lang, langs, env) {
     .map((r) => ({
       provider: 'opensubtitles',
       id: String(r.IDSubtitleFile || ''),
-      url: String(r.SubDownloadLink || '').replace(/^http:\/\//i, 'https://'), // legacy links come http://; https works on the same host
+      // legacy links come http://; https works on the same host. A LOOPBACK http link
+      // stays http (the Live Verification Lab's fixture mirror — fetchUpstreamSub's
+      // documented lab-override path); production links are always upgraded.
+      url: String(r.SubDownloadLink || '').replace(/^http:\/\//i, (m, off, s) =>
+        /:\/\/(localhost|127\.0\.0\.1|\[::1\])(:|\/)/.test(s) ? m : 'https://'),
       lang: r.SubLanguageID || r.ISO639 || 'en',
       release: r.MovieReleaseName || r.SubFileName || '',
       fileName: r.SubFileName || '',
@@ -456,13 +470,29 @@ async function openSubsSearch(imdb, season, episode, lang, langs, env) {
 /** The Stremio OpenSubtitles addon (no key, no login) — the SAME fallback official
  * AnantPlay uses when the legacy REST is unreachable (Subs.java:14, 74-77, 478-496).
  * Returns a mixed-language sample per title; we filter to the wanted codes.
- * Download URLs are plain UTF-8 .srt on subs*.strem.io (no gzip). */
-async function stremioOsSearch(type, imdb, season, episode, langs) {
+ * Download URLs are plain UTF-8 .srt on subs*.strem.io (no gzip).
+ *
+ * STREMIO_OS_BASE (env): test/lab-only override (loopback allowed) — the same
+ * documented pattern as OS_REST_BASE. */
+function stremioOsBase(env) {
+  const raw = String((env && env.STREMIO_OS_BASE) || '').trim() || 'https://opensubtitles-v3.strem.io';
+  try {
+    const u = new URL(raw);
+    const loopback = u.hostname === 'localhost' || u.hostname === '127.0.0.1' || u.hostname === '[::1]';
+    if (u.protocol !== 'https:' && !loopback) return 'https://opensubtitles-v3.strem.io';
+    if (u.username || u.password) return 'https://opensubtitles-v3.strem.io';
+    return u.origin;
+  } catch (e) {
+    return 'https://opensubtitles-v3.strem.io';
+  }
+}
+
+async function stremioOsSearch(type, imdb, season, episode, langs, env) {
   const want = langs && langs.length ? langs : ['sin', 'eng'];
   const path = (type === 'series'
     ? 'series/' + imdb + ':' + Math.max(1, season || 1) + ':' + Math.max(1, episode || 1)
     : 'movie/' + imdb) + '.json';
-  const res = await fetch('https://opensubtitles-v3.strem.io/subtitles/' + path, {
+  const res = await fetch(stremioOsBase(env) + '/subtitles/' + path, {
     headers: { 'User-Agent': SUBDL_UA, 'Accept': 'application/json' },
     redirect: 'follow',
     signal: typeof AbortSignal !== 'undefined' && AbortSignal.timeout ? AbortSignal.timeout(UPSTREAM_TIMEOUT_MS) : undefined,
@@ -545,9 +575,31 @@ async function decompressAny(bytes) {
 }
 
 /** Download + extract + normalize ONE upstream subtitle → clean UTF-8 SRT string.
- * Handles .gz (OpenSubtitles) and .zip (SubDL/piratelk) and plain .srt/.vtt. */
+ * Handles .gz (OpenSubtitles) and .zip (SubDL/piratelk) and plain .srt/.vtt.
+ *
+ * Lab/dev parity is an EXPLICIT OPERATOR OPT-IN, never implicit:
+ *   · `opts.allowHttp === false` (what /api/fetch-sub passes) can NEVER be
+ *     overridden here — a client-supplied http://127.0.0.1/… stays blocked.
+ *   · With no allowHttp hint at all, a loopback http:// URL is fetched only when
+ *     that literal loopback host was explicitly allowlisted in ALLOWED_SUB_HOSTS
+ *     (what the Live Verification Lab does for its fixture mirror). Production
+ *     ships an empty list, so loopback/private URLs remain SSRF-blocked.
+ * Every real host still goes through assertSafeUpstreamUrl (https-only, allowlist,
+ * private-IP rejection, per-redirect-hop re-validation). */
 async function fetchUpstreamSub(url, opts) {
-  const got = await safeFetchBytes(url, opts);
+  const o = opts || {};
+  let allowHttp = o.allowHttp === true;
+  if (!allowHttp && o.allowHttp !== false) { // `false` is authoritative — never bypass it
+    try {
+      const u = new URL(String(url));
+      const host = String(u.hostname || '').toLowerCase();
+      const loopback = host === 'localhost' || host === '127.0.0.1' || host === '[::1]';
+      const extra = (Array.isArray(o.extraHosts) ? o.extraHosts : [])
+        .map((h) => String(h || '').trim().toLowerCase()).filter(Boolean);
+      if (u.protocol === 'http:' && loopback && extra.indexOf(host) >= 0) allowHttp = true;
+    } catch (e) { /* not a URL — assertSafeUpstreamUrl will reject it */ }
+  }
+  const got = await safeFetchBytes(url, { ...o, allowHttp });
   const data = await decompressAny(got.bytes);
   const text = new TextDecoder('utf-8', { fatal: false }).decode(data.bytes);
   return toCleanSrt(text).text;

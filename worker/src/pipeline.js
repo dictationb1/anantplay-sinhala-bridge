@@ -1,49 +1,66 @@
-/* AnantPlay Sinhala Subtitle Bridge — v3 zero-fork subtitle pipeline.
+/* AnantPlay Sinhala Subtitle Bridge — v4 zero-fork multi-provider subtitle pipeline.
  *
- * Powers the standalone Companion app (repo: anantplay-si-companion) end to end:
+ * Powers the Sinhala Player app (repo: anantplay-sinhala-player) end to end:
  *
  *   /api/resolve?title=Clayface            → Cinemeta IMDb id + clean title/year
  *   /subtitles/movie/tt34890576.json       → human Sinhala first (OpenSubtitles sin,
- *                                             SubDL si), else an AI-translate job:
- *                                             the FULL English .srt is fetched once and
- *                                             translated in 4–6 large context batches by
- *                                             Gemini Flash (worker secret GEMINI_API_KEY —
- *                                             zero key typing on the phone), with a strict
- *                                             cue-count + byte-identical-timestamp validator.
- *   /api/paired/<jobId>.json               → THE <10 ms CUE-LOCK WEAPON: one compact JSON
- *                                             array of {i,t0,t1,en,enf,si} cues. The
- *                                             Companion matches AnantPlay's live English
- *                                             subtitle TextView against `en`/`enf` in RAM
- *                                             (O(1) sequential window) and shows `si` —
- *                                             frame-exact sync, zero per-line network.
- *   /sub/<token>.srt                       → real HTTP 200 UTF-8 SRT; while a job is still
- *                                             translating the SAME deterministic URL answers
- *                                             202 with {status, progress, eta_sec}.
+ *                                             SubDL si), else an AI-translate job
+ *   /api/paired/<jobId>.json               → compact {i,t0,t1,en,enf,si} cue array
+ *   /sub/<token>.srt                       → real HTTP 200 UTF-8 SRT; 202 progress
+ *   POST /api/subs-direct                  → NEW v4: translate a cast-supplied
+ *                                             English .srt (AnantPlay's own subs
+ *                                             extra / a side-loaded file) — the
+ *                                             player hands over what the cast
+ *                                             already carried.
  *
- * Jobs are keyed deterministically (type:imdb:season:episode), so the finished Sinhala .srt
- * is a PERMANENT cache: the second fetch of the same movie is a KV read away (<200 ms).
+ * ── v4 (this upgrade) — the zero-429 architecture ─────────────────────────────
+ *   · MULTI-PROVIDER FAILOVER (providers.js): azure → google_v3 → gemini →
+ *     workers_ai. Any 429 trips a 10-minute per-provider KV circuit breaker and
+ *     the batch seamlessly continues on the next provider. One legitimate key
+ *     per provider; NO multi-account farming (Google ToS risk documented).
+ *   · COMPACT PACED BATCHING: the numbered `n|text` protocol, 400–500 cues per
+ *     batch and max 2 in flight → a 1,500-cue movie is 3–4 total requests on
+ *     EVERY provider (verified by lab/verify_worker_v4_e2e.mjs).
+ *   · SINGLE-FLIGHT JOB LOCK (`lock:<jobId>` in KV with a 90 s heartbeat TTL):
+ *     a second poll during a translating job can NEVER spawn a duplicate
+ *     translation run — the isolate-miss restart storm that burned the v3
+ *     quota is structurally impossible now.
+ *   · RESUME, DON'T RESTART: with KV bound, a stalled job (dead isolate) resumes
+ *     from `sidone:<jobId>` batch flags — finished batches are never re-billed.
+ *     Without KV the worker says so LOUDLY in /health + /api/status
+ *     (storageWarn) so nobody wonders where a job went.
+ *   · TRANSLATION CACHE: once done, the finished .srt lives in KV permanently
+ *     (re-watch / seek / second device = zero quota, <50 ms).
  *
- * Storage: KV (recommended) for permanent jobs; without KV a per-isolate Map keeps jobs
- * alive for dev/self-host parity (artifacts still go to the Cache API). Zero Node APIs.
+ * Jobs are keyed deterministically (type:imdb:season:episode); artifacts use
+ * SHA-derived deterministic tokens. Storage: KV when bound (recommended,
+ * 100,000 reads/day + 1,000 writes/day free forever), per-isolate Map fallback
+ * otherwise (dev parity only). Zero Node APIs.
  */
 
 import {
   sha256Hex, publishSrt, parseSrtCues, reassembleSrt, toCleanSrt,
   openSubsSearch, stremioOsSearch, subdlSearch, pirateLkSearch, fetchUpstreamSub, SUBDL_UA,
 } from './lib.js';
+import {
+  chainOf, providerStatus, translateWithFailover, ProviderError,
+} from './providers.js';
+import { DEFAULT_LANG, LANGUAGES, langOf, isKnownLang, scriptReOf, maxCharsOf } from './languages.js';
+import {
+  cinemetaContext, registerForGenres, flagCuesForPolish, buildPolishPrompt, validPolishedCue,
+} from './cinema.js';
 
-const PIPELINE_VERSION = '3.0.0';
-const DEFAULT_GEMINI_MODEL = 'gemini-flash-latest';
-const DEFAULT_GEMINI_BASE = 'https://generativelanguage.googleapis.com';
-const GEMINI_TIMEOUT_MS = 120000;   // one big batch can legitimately take a while
+const PIPELINE_VERSION = '4.1.0';
 const SINHALA_RE = /[\u0D80-\u0DFF]/;
 const MIN_CUES = 8;                 // below this the file is not a real subtitle track
 const MAX_CUES = 6000;              // a 4-hour movie has ~4000 cues; refuse anything absurd
-const MIN_BATCHES = 4, MAX_BATCHES = 6, TARGET_CUES_PER_BATCH = 520;
+// v4 compact pacing: 3–4 requests per movie on every provider.
+const MIN_BATCHES = 3, MAX_BATCHES = 4, TARGET_CUES_PER_BATCH = 500;
 const SPLIT_MIN_CUES = 16;          // below this a failed batch is an error, not a split
-const STALLED_MS = 150000;          // a translating job with no progress update for 2.5 min → resume
+const STALLED_MS = 150000;          // translating + no progress update for 2.5 min → resume
 const RESTART_ERROR_AFTER_MS = 60000;
-const CONCURRENCY = 2;              // batches translated in parallel (rate-limit friendly)
+const CONCURRENCY = 2;              // ≤2 batches in flight — RPM-safe on every free tier
+const LOCK_TTL_MS = 90000;          // single-flight heartbeat window
 
 // ─────────────────────────────────────────────────────────────────────────────
 // job store — KV when bound, per-isolate Map fallback otherwise (dev / no-KV parity)
@@ -67,11 +84,26 @@ async function kvPut(env, key, value) {
 }
 
 /** `${type}:${imdb}:${season}:${episode}` — stable across requests, restarts and devices. */
+/** v4.1: the per-language job id — movie:tt123:0:0:si. The v4 bare id stays the
+ * 'si' job (default language), so every existing v4 test and cached KV entry
+ * keeps working unchanged. */
+function langJobIdOf(type, imdb, season, episode, lang) {
+  const l = isKnownLang(lang) ? String(lang) : DEFAULT_LANG;
+  const base = jobIdOf(type, imdb, season, episode);
+  return l === DEFAULT_LANG ? base : base + ':' + l;
+}
+function parseLangOf(jobId) {
+  const parts = String(jobId || '').split(':');
+  // movie:tt123:0:0[:lang] / direct:<hash>[:lang]
+  if (parts[0] === 'direct') return parts.length > 2 && isKnownLang(parts[2]) ? parts[2] : DEFAULT_LANG;
+  return parts.length > 4 && isKnownLang(parts[4]) ? parts[4] : DEFAULT_LANG;
+}
+
 function jobIdOf(type, imdb, season, episode) {
   return type + ':' + imdb + ':' + (season || 0) + ':' + (episode || 0);
 }
 
-const JOB_ID_RE = /^(movie|series):tt\d{4,10}:\d{1,4}:\d{1,5}$/;
+const JOB_ID_RE = /^(movie|series):tt\d{4,10}:\d{1,4}:\d{1,5}(:[a-z]{2}(-CN)?)?$/;
 
 async function deterministicToken(prefix, jobId) {
   return (await sha256Hex(prefix + '|' + jobId)).slice(0, 16);
@@ -88,12 +120,53 @@ async function putJob(env, job) {
   await kvPut(env, 'job:' + job.id, JSON.stringify(job));
 }
 
+// ── the single-flight lock ──────────────────────────────────────────────────
+
+/** Try to become the one translating runner for this job. A KV-held lock with a
+ * 90 s TTL (heartbeat-refreshed while the run is alive): another poll that
+ * lands mid-run sees the lock, does NOT start a second runner, and just answers
+ * progress. Without KV the Map gives the same guarantee inside one isolate. */
+async function acquireLock(env, jobId, now) {
+  const key = 'lock:' + jobId;
+  const raw = await kvGet(env, key).catch(() => null);
+  if (raw) {
+    const until = Number(raw) || 0;
+    if (until > (now || Date.now())) return false;   // a live runner exists
+  }
+  await kvPut(env, key, String((now || Date.now()) + LOCK_TTL_MS));
+  return true;
+}
+
+async function heartbeatLock(env, jobId, now) {
+  await kvPut(env, 'lock:' + jobId, String((now || Date.now()) + LOCK_TTL_MS)).catch(() => {});
+}
+
+async function releaseLock(env, jobId) {
+  if (env && env.SUBS_KV) { await env.SUBS_KV.delete('lock:' + jobId).catch(() => {}); return; }
+  memStore().delete('lock:' + jobId);
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Cinemeta (the same metadata service official AnantPlay resolves titles through)
 // ─────────────────────────────────────────────────────────────────────────────
 
-async function cinemetaFetch(path, timeoutMs) {
-  const res = await fetch('https://v3-cinemeta.strem.io' + path, {
+/** Cinemeta (the same metadata service official AnantPlay resolves titles through).
+ *  CINEMETA_BASE (env): test/lab-only override (loopback allowed). */
+function cinemetaBase(env) {
+  const raw = String((env && env.CINEMETA_BASE) || '').trim() || 'https://v3-cinemeta.strem.io';
+  try {
+    const u = new URL(raw);
+    const loopback = u.hostname === 'localhost' || u.hostname === '127.0.0.1' || u.hostname === '[::1]';
+    if (u.protocol !== 'https:' && !loopback) return 'https://v3-cinemeta.strem.io';
+    if (u.username || u.password) return 'https://v3-cinemeta.strem.io';
+    return u.origin;
+  } catch (e) {
+    return 'https://v3-cinemeta.strem.io';
+  }
+}
+
+async function cinemetaFetch(env, path, timeoutMs) {
+  const res = await fetch(cinemetaBase(env) + path, {
     headers: { 'User-Agent': SUBDL_UA, 'Accept': 'application/json' },
     redirect: 'manual',
     signal: typeof AbortSignal !== 'undefined' && AbortSignal.timeout ? AbortSignal.timeout(timeoutMs || 10000) : undefined,
@@ -103,10 +176,10 @@ async function cinemetaFetch(path, timeoutMs) {
 }
 
 /** Title (and optional season/episode) → {imdb, name, year} via Cinemeta search. */
-async function cinemetaResolve(title, type) {
+async function cinemetaResolve(title, type, env) {
   const q = String(title || '').trim();
   if (q.length < 2) return null;
-  const j = await cinemetaFetch('/catalog/' + type + '/top/search=' + encodeURIComponent(q.slice(0, 120)) + '.json');
+  const j = await cinemetaFetch(env, '/catalog/' + type + '/top/search=' + encodeURIComponent(q.slice(0, 120)) + '.json');
   const metas = j && Array.isArray(j.metas) ? j.metas : [];
   for (const m of metas) {
     const id = String(m.imdb_id || m.id || '');
@@ -118,8 +191,8 @@ async function cinemetaResolve(title, type) {
 }
 
 /** IMDb id → {imdb, name, year} via the Cinemeta meta detail endpoint. */
-async function cinemetaMeta(type, imdb) {
-  const j = await cinemetaFetch('/meta/' + type + '/' + encodeURIComponent(imdb) + '.json');
+async function cinemetaMeta(type, imdb, env) {
+  const j = await cinemetaFetch(env, '/meta/' + type + '/' + encodeURIComponent(imdb) + '.json');
   const m = j && j.meta ? j.meta : null;
   if (!m) return { imdb, name: imdb, year: '' };
   return { imdb, name: String(m.name || imdb), year: String(m.releaseInfo || m.year || '') };
@@ -131,7 +204,7 @@ async function cinemetaMeta(type, imdb) {
 
 /** EXACT flattening rule of AnantPlay's showCues() (PlayerActivity.java:356-358):
  * every inner '\n' becomes a space, EXCEPT when the next line starts with '-' or '–'
- * (a second speaker). The Companion sees this exact string in the subtitle TextView. */
+ * (a second speaker). The Player sees this exact string in the subtitle TextView. */
 function flattenLikeAnantPlay(text) {
   const s = String(text || '');
   let out = '';
@@ -171,146 +244,49 @@ function buildPairedCues(enCues, siTexts) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Gemini Flash translation (server-side, worker secret — nothing typed on the phone)
+// the provider-agnostic batch translator (v4)
 // ─────────────────────────────────────────────────────────────────────────────
 
-function geminiKeyOf(env, headers) {
-  const h = headers || {};
-  const fromHeader = typeof h.get === 'function' ? String(h.get('X-Gemini-Key') || '').trim() : '';
-  return fromHeader || String((env && env.GEMINI_API_KEY) || '').trim();
-}
-
-function geminiModelOf(env, headers) {
-  const h = headers || {};
-  const raw = (typeof h.get === 'function' ? String(h.get('X-Gemini-Model') || '').trim() : '')
-    || String((env && env.GEMINI_MODEL) || '').trim() || DEFAULT_GEMINI_MODEL;
-  return /^[\w.-]{1,64}$/.test(raw) ? raw : DEFAULT_GEMINI_MODEL;
-}
-
-/** API base override for the Live Verification Lab (mock Gemini). Production default is
- * Google's endpoint; a loopback base is allowed ONLY for local dev/testing. */
-function geminiBaseOf(env) {
-  const raw = String((env && env.GEMINI_API_BASE) || '').trim() || DEFAULT_GEMINI_BASE;
-  try {
-    const u = new URL(raw);
-    const loopback = u.hostname === 'localhost' || u.hostname === '127.0.0.1' || u.hostname === '[::1]';
-    if (u.protocol !== 'https:' && !loopback) return DEFAULT_GEMINI_BASE;
-    if (u.username || u.password) return DEFAULT_GEMINI_BASE;
-    return u.origin;
-  } catch (e) {
-    return DEFAULT_GEMINI_BASE;
-  }
-}
-
-function buildTranslatePrompt(count, retryNote) {
-  return 'You are a professional movie subtitle translator. Translate English subtitles into natural, fluent, spoken Sinhala (සිංහල).\n'
-    + 'STRICT output rules:\n'
-    + '- Output EXACTLY one line per input line, in the format: <number>|<Sinhala translation>\n'
-    + '- Keep the <number> unchanged. Never merge, split, reorder or skip lines.\n'
-    + '- Translate meaning and tone, not word-for-word. Use everyday spoken Sinhala a Sri Lankan audience reads instantly.\n'
-    + '- Keep proper names (people, places, brands) in their common Sinhala transliteration when one exists, otherwise keep them in Latin script.\n'
-    + '- If a line starts with "- " (a speaker dash), keep the dash: "- <translation>".\n'
-    + '- Lines that are only music notes (#), punctuation or sound cues may be kept as-is.\n'
-    + '- Never add quotes, explanations, notes or English duplicates.\n'
-    + '- Never answer in English; every translated line must be Sinhala script.\n'
-    + (retryNote ? '\nIMPORTANT: your previous answer was rejected. ' + retryNote + '\n' : '')
-    + '\nNow translate these ' + count + ' numbered subtitle lines:\n';
-}
-
-/** One Gemini call for one batch of numbered cues.
- * items: [{i, text}] → array of Sinhala strings aligned with items.
- * Throws {code:'truncated'} when the model hit its output limit (caller splits the batch). */
-async function geminiTranslateBatch(env, key, model, items) {
-  const prompt = buildTranslatePrompt(items.length)
-    + items.map((it) => it.i + '|' + it.text).join('\n');
-  const url = geminiBaseOf(env) + '/v1beta/models/' + encodeURIComponent(model) + ':generateContent';
-  const res = await fetch(url, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'x-goog-api-key': key, 'User-Agent': SUBDL_UA },
-    signal: typeof AbortSignal !== 'undefined' && AbortSignal.timeout ? AbortSignal.timeout(GEMINI_TIMEOUT_MS) : undefined,
-    body: JSON.stringify({
-      contents: [{ parts: [{ text: prompt }] }],
-      generationConfig: { temperature: 0.15, topP: 0.9, maxOutputTokens: 65536 },
-    }),
-  });
-  if (!res.ok) {
-    const body = await res.text().catch(() => '');
-    throw new Error('gemini ' + res.status + ' ' + body.slice(0, 200));
-  }
-  const j = await res.json().catch(() => null);
-  const cand = j && Array.isArray(j.candidates) ? j.candidates[0] : null;
-  const parts = cand && cand.content && Array.isArray(cand.content.parts) ? cand.content.parts : [];
-  const text = parts.map((p) => p && p.text ? p.text : '').join('');
-  if (!text) throw new Error('gemini empty answer (finishReason ' + (cand && cand.finishReason) + ')');
-
-  const map = new Map();
-  for (const line of text.split('\n')) {
-    const m = /^\s*(\d+)\s*\|\s?(.*)$/.exec(line);
-    if (m) {
-      const n = Number(m[1]);
-      if (!map.has(n)) map.set(n, m[2].trim());
-    }
-  }
-  // every input number present exactly once, non-empty for non-empty input
-  const missing = [];
-  for (const it of items) {
-    const v = map.get(it.i);
-    if (v === undefined || v === '') missing.push(it.i);
-  }
-  if (missing.length) {
-    const truncated = cand && String(cand.finishReason || '') === 'MAX_TOKENS';
-    if (truncated || map.size < items.length) {
-      const err = new Error('gemini answer incomplete: ' + missing.length + ' lines missing');
-      err.code = 'truncated';
-      throw err;
-    }
-    throw new Error('gemini answer missing lines: ' + missing.slice(0, 8).join(',') + (missing.length > 8 ? '…' : ''));
-  }
-  // Sinhala-script sanity: ≥60% of meaningful lines must contain Sinhala characters
-  let meaningful = 0, si = 0;
-  for (const it of items) {
-    const v = map.get(it.i);
-    if (v && v.replace(/[-–#\s.,!?'"…:;]/g, '').length >= 2) {
-      meaningful++;
-      if (SINHALA_RE.test(v)) si++;
-    }
-  }
-  if (meaningful > 0 && si / meaningful < 0.6) {
-    throw new Error('gemini answered in the wrong language (Sinhala script in only ' + si + '/' + meaningful + ' lines)');
-  }
-  return items.map((it) => map.get(it.i));
-}
-
-/** A batch with retry + adaptive splitting: a truncated/failed batch is retried once with
- * a corrective note, then split in half until it fits the model's output limit. */
-async function translateBatchRobust(env, key, model, items) {
+/** Translate one batch of cues with provider failover, splitting when the model's
+ * output limit truncates the answer (LLM providers only; MT providers never need
+ * this because their chunking respects the request caps). */
+async function translateBatchRobust(env, items, cfg) {
   let lastErr = null;
   for (let attempt = 0; attempt < 2; attempt++) {
     try {
-      return await geminiTranslateBatch(env, key, model, items);
+      const r = await translateWithFailover(env, items, (k) => kvGet(env, k), (k, v) => kvPut(env, k, v), cfg);
+      return r;
     } catch (e) {
       lastErr = e;
-      if (e && e.code === 'truncated') break; // splitting is better than retrying a truncation
+      const truncated = e && e.errors && e.errors.some((x) => /truncated/.test(String(x)));
+      if (truncated) break; // splitting beats retrying a truncation
     }
   }
   if (items.length >= SPLIT_MIN_CUES * 2) {
     const mid = Math.floor(items.length / 2);
-    const a = await translateBatchRobust(env, key, model, items.slice(0, mid));
-    const b = await translateBatchRobust(env, key, model, items.slice(mid));
-    return a.concat(b);
+    const a = await translateBatchRobust(env, items.slice(0, mid), cfg);
+    const b = await translateBatchRobust(env, items.slice(mid), cfg);
+    return {
+      texts: a.texts.concat(b.texts),
+      provider: a.provider + '+' + b.provider,
+    };
   }
-  if (lastErr && lastErr.code === 'truncated' && items.length >= SPLIT_MIN_CUES) {
-    // one last halving even below the comfortable split floor
+  // one last halving even below the comfortable split floor (v3 behaviour:
+  // a 16–31-cue truncated batch still gets one chance to fit)
+  if (lastErr && lastErr.errors && lastErr.errors.some((x) => /truncated/.test(String(x))) && items.length >= SPLIT_MIN_CUES) {
     const mid = Math.floor(items.length / 2);
-    const a = await translateBatchRobust(env, key, model, items.slice(0, mid));
-    const b = await translateBatchRobust(env, key, model, items.slice(mid));
-    return a.concat(b);
+    const a = await translateBatchRobust(env, items.slice(0, mid), cfg);
+    const b = await translateBatchRobust(env, items.slice(mid), cfg);
+    return {
+      texts: a.texts.concat(b.texts),
+      provider: a.provider + '+' + b.provider,
+    };
   }
-  throw lastErr || new Error('gemini translation failed');
+  throw lastErr || new Error('translation failed');
 }
 
-/** Deterministic batch boundaries from the cue count alone → 4–6 batches, so a resumed
- * run splits identically and per-batch progress flags stay valid. */
+/** Deterministic batch boundaries from the cue count alone → 3–4 batches, so a
+ * resumed run splits identically and per-batch progress flags stay valid. */
 function makeBatches(cueCount) {
   if (cueCount <= 0) return [];
   if (cueCount < MIN_BATCHES * SPLIT_MIN_CUES) return [Array.from({ length: cueCount }, (_, i) => i)];
@@ -326,7 +302,7 @@ function makeBatches(cueCount) {
   return batches;
 }
 
-/** Small promise pool — keeps CONCURRENCY batches in flight. */
+/** Small promise pool — keeps CONCURRENCY batches in flight (RPM-safe pacing). */
 async function runPool(items, n, fn) {
   let next = 0;
   const workers = Array.from({ length: Math.max(1, Math.min(n, items.length)) }, async () => {
@@ -353,10 +329,21 @@ function pickHumanSub(results, lang) {
   return same.length ? same[0] : null; // openSubsSearch already sorts by downloads
 }
 
+/** Publish a finished job's artifacts (the shared tail of every done path). */
+async function publishDoneJob(env, jobId, siText, siToken, enText, enToken, extra) {
+  await publishSrt(env, siText, { token: siToken, permanent: true });
+  if (enToken && enText) await publishSrt(env, enText, { token: enToken, permanent: true });
+  await kvPut(env, 'subjob:' + siToken, jobId);
+  if (enToken) await kvPut(env, 'subjob:' + enToken, jobId);
+  const job = { id: jobId, status: 'done', siToken, enToken: enToken || null, updatedAt: Date.now(), ...extra };
+  await putJob(env, job);
+  return job;
+}
+
 /**
  * The one call behind GET /subtitles/:type/:id.json.
  * Returns {job} (done | translating | error), or {needsKey} / {notFound, hints}.
- * `started` is the background promise when a new translation job was kicked off —
+ * `started` is the background promise when a new translation run was kicked off —
  * the route passes it to ctx.waitUntil().
  */
 async function ensureSubtitleJob(env, ctx, params) {
@@ -366,23 +353,28 @@ async function ensureSubtitleJob(env, ctx, params) {
   const season = type === 'series' ? clampInt(params.season, 0, 999) : 0;
   const episode = type === 'series' ? clampInt(params.episode, 0, 9999) : 0;
   const titleHint = String(params.title || '').slice(0, 200);
-  const jobId = jobIdOf(type, imdb, season, episode);
+  // v4.1: the target language (si default — v4 callers unchanged) + register override
+  const lang = isKnownLang(params.lang) ? String(params.lang) : DEFAULT_LANG;
+  const register = params.register === 'spoken' || params.register === 'formal' ? params.register : 'auto';
+  const jobId = langJobIdOf(type, imdb, season, episode, lang);
   const now = Date.now();
   const siToken = await deterministicToken('si', jobId);
   const enToken = await deterministicToken('en', jobId);
-  const key0 = geminiKeyOf(env, params.headers); // NOTE: never persisted into the job record
+  const langInfo = langOf(lang);
 
   // 1. cached job?
   const existing = await getJob(env, jobId);
   if (existing && !params.fresh) {
     if (existing.status === 'done') return { job: existing };
     if (existing.status === 'translating') {
+      // SINGLE-FLIGHT: only the lock holder runs; a second poll just reads state.
+      const locked = await acquireLock(env, jobId);
+      if (!locked) return { job: existing };
       if (now - (existing.updatedAt || 0) > STALLED_MS) {
-        // stalled (isolate died mid-job): resume it in the background, answer now.
-        // NOTE: the API key is NEVER persisted — the resume uses this request's key.
-        const p = resumeTranslationJob(env, key0, existing.model, jobId).catch(() => {});
+        const p = resumeTranslationJob(env, jobId).finally(() => releaseLock(env, jobId)).catch(() => {});
         return { job: existing, started: p };
       }
+      await releaseLock(env, jobId);
       return { job: existing };
     }
     if (existing.status === 'error' && now - (existing.updatedAt || 0) < RESTART_ERROR_AFTER_MS) {
@@ -393,18 +385,27 @@ async function ensureSubtitleJob(env, ctx, params) {
   // 2. human Sinhala first — the richest Sinhala index is the legacy OpenSubtitles REST
   //    (ChameE/Baiscope uploads); the Stremio addon and SubDL si are the fallbacks.
   //    Any of them can be rate-limited (403) at any moment; every leg degrades cleanly.
+  //    ZERO translation quota is ever spent when a human file exists.
   const subdlKey = String((env && env.SUBDL_API_KEY) || '').trim() || String(params.subdlKey || '').trim();
+  // v4.1: human subs in ANY registry language (OpenSubtitles ISO-639-2B codes).
+  // For the DEFAULT si job this is byte-identical to v4 (sin); other languages
+  // map through the registry (tam, hin, spa, jpn, ara…). SubDL search API takes
+  // one language per call; si keeps the v4 behaviour, others query their code.
+  const osLangs = [langInfo.osCode];
   const [osSi, stremioSi, subdlSi] = await Promise.all([
-    openSubsSearch(imdb, season, episode, null, ['sin'], env).catch(() => []),
-    stremioOsSearch(type, imdb, season, episode, ['sin']).catch(() => []),
-    subdlSearch(imdb, season, episode, null, subdlKey).catch(() => []),
+    openSubsSearch(imdb, season, episode, null, osLangs, env).catch(() => []),
+    stremioOsSearch(type, imdb, season, episode, osLangs, env).catch(() => []),
+    (async () => {
+      if (lang !== DEFAULT_LANG) return [];   // SubDL si-only in v4 parity; other langs via OS/stremio
+      return subdlSearch(imdb, season, episode, null, subdlKey).catch(() => []);
+    })(),
   ]);
   const humanCandidates = [];
-  const osBest = pickHumanSub(osSi, 'sin');
+  const osBest = pickHumanSub(osSi, langInfo.osCode);
   if (osBest) humanCandidates.push(osBest);
-  const stremioBest = pickHumanSub(stremioSi, 'sin');
+  const stremioBest = pickHumanSub(stremioSi, langInfo.osCode);
   if (stremioBest) humanCandidates.push(stremioBest);
-  const sdBest = pickHumanSub(subdlSi, 'si');
+  const sdBest = lang === DEFAULT_LANG ? pickHumanSub(subdlSi, 'si') : null;
   if (sdBest) humanCandidates.push(sdBest);
 
   for (const cand of humanCandidates) {
@@ -415,11 +416,12 @@ async function ensureSubtitleJob(env, ctx, params) {
       const cues = parseSrtCues(siText);
       if (cues.length < MIN_CUES) continue; // a stub file — try the next provider
       await publishSrt(env, siText, { token: siToken, permanent: true });
-      await kvPut(env, 'subjob:' + siToken, jobId); // /sub/<siToken>.srt 202-progress map
+      await kvPut(env, 'subjob:' + siToken, jobId);
       const job = {
         id: jobId, type, imdb, season, episode, status: 'done', source: 'human',
         provider: cand.provider, release: cand.release || '', cues: cues.length,
         siToken, enToken: null, model: null, createdAt: now,
+        lang, quality: 'human', polishStatus: 'off',
       };
       await putJob(env, job);
       await kvPut(env, 'paired:' + jobId, JSON.stringify({
@@ -429,29 +431,28 @@ async function ensureSubtitleJob(env, ctx, params) {
     } catch (e) { /* try the next provider */ }
   }
 
-  // 3. no human Sinhala → AI-translate the best English file (Clayface path).
-  //    English source: legacy OpenSubtitles REST first, the Stremio addon as fallback
-  //    (the same pair official AnantPlay tries). A specific file can be captcha-gated
-  //    (302 → www.opensubtitles.org/captcha2) or rate-limited, so try up to 3 candidates.
+  // 3. no human Sinhala → AI-translate the best English file through the
+  //    multi-provider chain (azure → google_v3 → gemini → workers_ai).
+  //    A specific file can be captcha-gated (302 → captcha) or rate-limited,
+  //    so try up to 4 candidates.
   const [osEn, stremioEn] = await Promise.all([
     openSubsSearch(imdb, season, episode, null, ['eng'], env).catch(() => []),
-    stremioOsSearch(type, imdb, season, episode, ['eng']).catch(() => []),
+    stremioOsSearch(type, imdb, season, episode, ['eng'], env).catch(() => []),
   ]);
   const enCandidates = [];
   for (const r of osEn) { if (enCandidates.length < 3) enCandidates.push(r); }
   for (const r of stremioEn) { if (enCandidates.length < 4) enCandidates.push(r); }
   const enCand = enCandidates[0] || null;
-  const key = key0;
   if (!enCand) {
     const hints = [];
     if (titleHint) hints.push({ provider: 'piratelk', url: 'https://piratelk.com/?s=' + encodeURIComponent(titleHint) });
     hints.push({ provider: 'opensubtitles', url: 'https://rest.opensubtitles.org/search/imdbid-' + imdb.replace(/^tt/, '') + '/sublanguageid-sin' });
     return { notFound: true, hints };
   }
-  if (!key) {
-    return { needsKey: 'No human Sinhala subtitle exists for this title yet. Set the GEMINI_API_KEY worker secret (wrangler secret put GEMINI_API_KEY) to let the bridge translate the English file with Gemini Flash.' };
+  const chain = chainOf(env, lang);
+  if (!chain.length) {
+    return { needsKey: 'No human subtitle exists for this title in ' + langInfo.english + ' yet, and no translation provider is configured. Set ONE of: wrangler secret put AZURE_TRANSLATOR_KEY (2M chars/month free), wrangler secret put GOOGLE_V3_KEY (500K chars/month free), wrangler secret put GEMINI_API_KEY, or add the [ai] binding (Workers AI).' };
   }
-  const model = geminiModelOf(env, params.headers);
 
   // fetch the COMPLETE synced English .srt once (cached in entext:<jobId>);
   // a captcha-gated or rate-limited file falls through to the next candidate
@@ -488,35 +489,44 @@ async function ensureSubtitleJob(env, ctx, params) {
   const job = existing && existing.status === 'translating'
     ? existing
     : {
-        id: jobId, type, imdb, season, episode, status: 'translating', source: 'gemini',
-        provider: chosen.provider, release: chosen.release || '', cues: enCues.length,
-        siToken, enToken, model, done: 0, total: batches.length,
+        id: jobId, type, imdb, season, episode, status: 'translating', source: 'ai',
+        provider: chain[0], chain: chain.slice(), release: chosen.release || '', cues: enCues.length,
+        siToken, enToken, done: 0, total: batches.length, providers: [],
         batchDone: batches.map(() => false), startedAt: now, createdAt: now, error: null,
+        // v4.1 two-stage + multi-language state
+        lang, register, quality: 'base-nmt', polishStatus: 'pending',
       };
+  job.lang = lang;
+  job.register = register;
+  if (job.status !== 'done') { job.quality = job.quality || 'base-nmt'; job.polishStatus = job.polishStatus || 'pending'; }
   if (params.fresh || !existing || existing.status !== 'translating') {
     job.done = 0;
     job.total = batches.length;
     job.batchDone = batches.map(() => false);
     job.startedAt = now;
     job.error = null;
-    job.model = model;
     await kvPut(env, 'sidone:' + jobId, JSON.stringify(new Array(enCues.length).fill('')));
   }
   job.status = 'translating';
   await putJob(env, job);
-  const started = resumeTranslationJob(env, key, model, jobId).catch(() => {});
+  // single-flight: if another runner is already on it, just report progress
+  const locked = await acquireLock(env, jobId);
+  if (!locked) return { job };
+  const started = resumeTranslationJob(env, jobId).finally(() => releaseLock(env, jobId)).catch(() => {});
   return { job, started };
 }
 
-/** Translate every unfinished batch, then validate + publish the finished pair.
- * Idempotent: safe to call again after a stall — finished batches are skipped. */
-async function resumeTranslationJob(env, key, model, jobId) {
+/** Translate every unfinished batch through the failover chain, then validate +
+ * publish the finished pair. Idempotent: safe to call again after a stall —
+ * finished batches are skipped (a resumed run never re-bills finished work).
+ * The lock holder heartbeats while running so polls never double-spawn it. */
+async function resumeTranslationJob(env, jobId) {
   const job = await getJob(env, jobId);
   if (!job || job.status !== 'translating') return;
   const enText = await kvGet(env, 'entext:' + jobId);
   if (!enText) {
     job.status = 'error';
-    job.error = 'cached English source vanished (re-request with ?fresh=1)';
+    job.error = 'cached English source vanished (re-request with ?fresh=1) — without SUBS_KV bound, jobs do not survive isolate restarts';
     await putJob(env, job);
     return;
   }
@@ -532,24 +542,26 @@ async function resumeTranslationJob(env, key, model, jobId) {
   if (!Array.isArray(job.batchDone) || job.batchDone.length !== batches.length) {
     job.batchDone = batches.map(() => false);
   }
-
-  const pending = [];
-  for (let b = 0; b < batches.length; b++) if (!job.batchDone[b]) pending.push(b);
+  const heartbeat = setInterval(() => heartbeatLock(env, jobId), 30000);
 
   try {
-    await runPool(pending, CONCURRENCY, async (b) => {
+    await runPool(batches.map((_, b) => b).filter((b) => !job.batchDone[b]), CONCURRENCY, async (b) => {
       const idxs = batches[b];
       const items = idxs.map((i) => ({ i, text: enCues[i].lines.join('\n') }));
-      const translated = await translateBatchRobust(env, key, model, items);
-      for (let k = 0; k < idxs.length; k++) siTexts[idxs[k]] = translated[k];
+      const r = await translateBatchRobust(env, items, { model: job.model, targetLang: job.lang || DEFAULT_LANG });
+      for (let k = 0; k < idxs.length; k++) siTexts[idxs[k]] = r.texts[k];
       job.batchDone[b] = true;
       job.done = job.batchDone.filter(Boolean).length;
+      if (job.providers && job.providers.indexOf(r.provider) < 0) job.providers.push(r.provider);
+      job.provider = r.provider;
       await putJob(env, job);
       await kvPut(env, 'sidone:' + jobId, JSON.stringify(siTexts));
     });
 
     // ── final validator: cue count identical + every timestamp byte-identical ──
-    const siCues = enCues.map((c, i) => ({ ts: c.ts, lines: (siTexts[i] || c.lines.join('\n')).split('\n') }));
+    const lang = job.lang || DEFAULT_LANG;
+    const langInfo = langOf(lang);
+    const siCues = enCues.map((c, i) => ({ ts: c.ts, lines: String(siTexts[i] || c.lines.join('\n')).split('\n') }));
     const siSrt = reassembleSrt(siCues);
     const reEn = parseSrtCues(enText);
     const reSi = parseSrtCues(siSrt);
@@ -557,31 +569,169 @@ async function resumeTranslationJob(env, key, model, jobId) {
     for (let i = 0; i < reEn.length; i++) {
       if (reEn[i].ts !== reSi[i].ts) throw new Error('validator: timestamp changed at cue ' + (i + 1));
     }
+    // v4.1: the script check uses the TARGET language's script (si → Sinhala block,
+    // ta → Tamil block, ja → CJK …) — Sinhala stays the default behaviour.
+    const scriptRe = scriptReOf(lang) || SINHALA_RE;
     let meaningful = 0, siCount = 0;
     for (const t of siTexts) {
       if (t && t.replace(/[-–#\s.,!?'"…:;]/g, '').length >= 2) {
         meaningful++;
-        if (SINHALA_RE.test(t)) siCount++;
+        if (scriptRe.test(t)) siCount++;
       }
     }
-    if (meaningful > 0 && siCount / meaningful < 0.6) throw new Error('validator: Sinhala script in only ' + siCount + '/' + meaningful + ' cues');
+    if (meaningful > 0 && siCount / meaningful < 0.6) {
+      throw new Error('validator: ' + langInfo.english + ' script in only ' + siCount + '/' + meaningful + ' cues');
+    }
 
-    // ── publish the permanent pair + the compact cue-lock payload ──
+    // ── STAGE 1 PUBLISH (two-stage delivery): the valid base .srt goes live NOW ──
+    // quality:"base-nmt" + polishStatus:"pending"; /sub/<token>.srt is playable
+    // this second. The cinema polish below upgrades the SAME token in place.
     const cleanSi = toCleanSrt(siSrt).text;
     await publishSrt(env, cleanSi, { token: job.siToken, permanent: true });
     await publishSrt(env, enText, { token: job.enToken, permanent: true });
     await kvPut(env, 'paired:' + jobId, JSON.stringify({
-      jobId, status: 'done', source: 'gemini', cues: buildPairedCues(enCues, siTexts),
+      jobId, status: 'done', source: 'ai', cues: buildPairedCues(enCues, siTexts),
     }));
     job.status = 'done';
     job.done = job.total;
     job.error = null;
+    job.quality = 'base-nmt';
+    job.polishStatus = 'pending';
     await putJob(env, job);
+
+    // ── STAGE 2 (silent cinema upgrade): polish flagged cues, swap in place ──
+    // Never throws outward: any failure leaves the published base .srt intact
+    // (the swap only happens after the full validator passes again).
+    try {
+      await runCinemaPolish(env, jobId);
+    } catch (pe) {
+      job.polishStatus = 'failed';
+      job.polishError = String((pe && pe.message) || pe).slice(0, 200);
+      await putJob(env, job).catch(() => {});
+    }
   } catch (e) {
     job.status = 'error';
     job.error = String((e && e.message) || e);
     await putJob(env, job);
+  } finally {
+    clearInterval(heartbeat);
   }
+}
+
+
+// ─────────────────────────────────────────────────────────────────────────────
+// v4.1 STAGE 2 — the silent cinema polish (background, resumable, fail-safe)
+// ─────────────────────────────────────────────────────────────────────────────
+
+const POLISH_BATCH_CUES = 120;       // ≤3 LLM calls for a 1,500-cue movie (300 flags / 120)
+const POLISH_RECENT_CONTEXT = 5;     // sliding window: last 5 translated cues (read-only)
+
+/** Polish the flagged cues of a DONE base-nmt job and swap the .srt in place.
+ *  Resumable: progress lives in KV (polish:<jobId> = {batchDone[], texts{}}),
+ *  so a dead isolate loses nothing. Idempotent + fail-safe by contract:
+ *  ANY error aborts quietly — the base .srt stays published and playable. */
+async function runCinemaPolish(env, jobId) {
+  const job = await getJob(env, jobId);
+  if (!job || job.status !== 'done') return;
+  const lang = job.lang || DEFAULT_LANG;
+  const register = job.register === 'spoken' || job.register === 'formal'
+    ? job.register
+    : registerOfJob(env, job);
+  const enText = await kvGet(env, 'entext:' + jobId);
+  if (!enText) return;                                  // nothing to polish against
+  const enCues = parseSrtCues(enText);
+  let siTexts = [];
+  try { siTexts = JSON.parse((await kvGet(env, 'sidone:' + jobId)) || '[]'); } catch (e) {}
+  if (!Array.isArray(siTexts) || siTexts.length !== enCues.length) return;
+
+  // deterministic flags (same input → same flags → resumable batches line up)
+  const enLines = enCues.map((c) => c.lines.join('\n'));
+  const flags = flagCuesForPolish(enLines, siTexts, lang, register, 20);
+  if (!flags.size) {
+    job.polishStatus = 'done';                          // nothing worth polishing
+    job.quality = job.quality || 'base-nmt';
+    await putJob(env, job);
+    return;
+  }
+  const flagged = [...flags.keys()];
+  const batches = [];
+  for (let i = 0; i < flagged.length; i += POLISH_BATCH_CUES) batches.push(flagged.slice(i, i + POLISH_BATCH_CUES));
+
+  // resumable state
+  let st = null;
+  try { st = JSON.parse((await kvGet(env, 'polish:' + jobId)) || 'null'); } catch (e) {}
+  if (!st || !Array.isArray(st.batchDone) || st.batchDone.length !== batches.length) {
+    st = { batchDone: batches.map(() => false), fixed: {} };
+  }
+
+  // movie context (KV-cached per imdb) — best-effort
+  let ctx = { title: job.name || '', year: '', genres: [], cast: [], plot: '' };
+  try {
+    if (job.imdb) ctx = await cinemetaContext(env, job.type === 'series' ? 'series' : 'movie', job.imdb,
+      (k) => kvGet(env, k), (k, v) => kvPut(env, k, v));
+  } catch (e) { /* generic context is fine */ }
+
+  for (let b = 0; b < batches.length; b++) {
+    if (st.batchDone[b]) continue;
+    const idxs = batches[b];
+    const items = idxs.map((i) => ({ i: i + 1, text: enLines[i] }));
+    const recent = idxs[0] > POLISH_RECENT_CONTEXT
+      ? siTexts.slice(Math.max(0, idxs[0] - POLISH_RECENT_CONTEXT), idxs[0])
+      : [];
+    const prompt = buildPolishPrompt(
+      idxs.map((i) => ({ i: i + 1, en: enLines[i], draft: siTexts[i] })),
+      ctx, lang, register, recent,
+    );
+    // polish rides the LLM providers (gemini → workers_ai …) through the same
+    // failover + breakers; the numbered protocol is identical to base batches
+    const r = await translateWithFailover(env, items,
+      (k) => kvGet(env, k), (k, v) => kvPut(env, k, v),
+      { model: null, targetLang: lang, polishPrompt: prompt, isPolish: true, promptKind: 'polish', providerKind: 'llm' });
+    // map answers back through the PER-CUE fallback validator
+    const answers = r.texts;
+    for (let k = 0; k < idxs.length; k++) {
+      const cueIdx = idxs[k];
+      const polished = String(answers[k] || '');
+      if (validPolishedCue(enLines[cueIdx], polished, siTexts[cueIdx], lang)) {
+        st.fixed[cueIdx] = polished;
+      }
+      // else: keep the clean NMT draft for this cue (never corrupt the batch)
+    }
+    st.batchDone[b] = true;
+    await kvPut(env, 'polish:' + jobId, JSON.stringify(st));
+  }
+
+  // swap in place — ONLY after the full validator passes again
+  const finalTexts = siTexts.map((t, i) => (st.fixed[i] !== undefined ? st.fixed[i] : t));
+  const siCues = enCues.map((c, i) => ({ ts: c.ts, lines: String(finalTexts[i] || c.lines.join('\n')).split('\n') }));
+  const siSrt = reassembleSrt(siCues);
+  const reEn = parseSrtCues(enText);
+  const reSi = parseSrtCues(siSrt);
+  if (reSi.length !== reEn.length) return;                       // abort swap, base stays
+  for (let i = 0; i < reEn.length; i++) {
+    if (reEn[i].ts !== reSi[i].ts) return;
+  }
+  const cleanSi = toCleanSrt(siSrt).text;
+  await publishSrt(env, cleanSi, { token: job.siToken, permanent: true, force: true });
+  await kvPut(env, 'sidone:' + jobId, JSON.stringify(finalTexts));
+  await kvPut(env, 'paired:' + jobId, JSON.stringify({
+    jobId, status: 'done', source: 'ai', cues: buildPairedCues(enCues, finalTexts),
+  }));
+  job.quality = 'cinema-polished';
+  job.polishStatus = 'done';
+  await putJob(env, job);
+}
+
+/** genre → register (auto mode): Cinemeta genres when we have them, else spoken. */
+async function registerOfJob(env, job) {
+  try {
+    if (job.imdb) {
+      const ctx = await cinemetaContext(env, job.type === 'series' ? 'series' : 'movie', job.imdb,
+        (k) => kvGet(env, k), (k, v) => kvPut(env, k, v));
+      return registerForGenres(ctx.genres, null);
+    }
+  } catch (e) { /* fall through */ }
+  return 'spoken';
 }
 
 /** The /api/paired/:jobId.json payload (plus status shaping for the routes). */
@@ -597,10 +747,10 @@ async function getPaired(env, jobId) {
       } catch (e) { /* fall through to rebuild */ }
       // rebuild from the stored pair (paired blob evicted but subs remain)
       const enText = await kvGet(env, 'entext:' + jobId);
-      if (enText && job.source === 'gemini') {
+      if (enText && job.source === 'ai') {
         const enCues = parseSrtCues(enText);
         const siTexts = JSON.parse((await kvGet(env, 'sidone:' + jobId)) || '[]');
-        const body = { ok: true, jobId, status: 'done', source: 'gemini', cues: buildPairedCues(enCues, Array.isArray(siTexts) ? siTexts : null) };
+        const body = { ok: true, jobId, status: 'done', source: 'ai', cues: buildPairedCues(enCues, Array.isArray(siTexts) ? siTexts : null) };
         return { status: 200, body };
       }
     }
@@ -611,7 +761,7 @@ async function getPaired(env, jobId) {
     const eta = job.startedAt && done > 0 ? Math.max(1, Math.round(((Date.now() - job.startedAt) / done) * (total - done) / 1000)) : null;
     return {
       status: 202,
-      body: { ok: true, jobId, status: 'translating', progress: +(done / total).toFixed(3), done, total, eta_sec: eta },
+      body: { ok: true, jobId, status: 'translating', progress: +(done / total).toFixed(3), done, total, eta_sec: eta, provider: job.provider },
     };
   }
   return { status: 200, body: { ok: false, jobId, status: 'error', error: job.error || 'job failed' } };
@@ -624,10 +774,79 @@ async function jobForToken(env, token) {
   return getJob(env, jobId);
 }
 
+/**
+ * NEW v4 — translate a cast-supplied English subtitle text (the `subs` URLs
+ * AnantPlay's POST /play payload already carries, or a side-loaded file the
+ * player picked). No IMDb needed: the finished .srt is published under a
+ * deterministic token derived from the text itself, so the same file is
+ * translated once and cached forever.
+ */
+async function translateDirectSub(env, ctx, srtText, opts) {
+  const o = opts || {};
+  let clean;
+  try {
+    clean = toCleanSrt(String(srtText || ''));
+  } catch (e) {
+    return { badRequest: 'not a usable .srt: ' + (e && e.message ? e.message : e) };
+  }
+  const enCues = parseSrtCues(clean.text);
+  if (enCues.length < MIN_CUES || enCues.length > MAX_CUES) {
+    return { badRequest: 'subtitle has ' + enCues.length + ' cues (need ' + MIN_CUES + '–' + MAX_CUES + ')' };
+  }
+  // v4.1: the target language of a direct cast-sub job (si default = v4 parity)
+  const lang = isKnownLang(o.lang) ? String(o.lang) : DEFAULT_LANG;
+  const register = o.register === 'spoken' || o.register === 'formal' ? o.register : 'auto';
+  if (lang === 'en') {
+    // English target: the supplied file already IS English — publish it as-is
+    const contentToken0 = await sha256Hex('direct|' + clean.text).then((h) => h.slice(0, 16));
+    const jobId0 = 'direct:' + contentToken0 + ':en';
+    const enToken0 = await deterministicToken('en', jobId0);
+    await publishSrt(env, clean.text, { token: enToken0, permanent: true });
+    await kvPut(env, 'subjob:' + enToken0, jobId0);
+    const job0 = { id: jobId0, type: 'direct', imdb: null, season: 0, episode: 0, status: 'done',
+      source: 'human', provider: 'supplied', release: o.name || 'cast-subs', cues: enCues.length,
+      siToken: enToken0, enToken: enToken0, lang: 'en', quality: 'human', polishStatus: 'off', createdAt: Date.now() };
+    await putJob(env, job0);
+    return { job: job0 };
+  }
+  const chain = chainOf(env, lang);
+  if (!chain.length) {
+    return { needsKey: 'No translation provider configured. Set ONE of: AZURE_TRANSLATOR_KEY, GOOGLE_V3_KEY, GEMINI_API_KEY or the [ai] binding.' };
+  }
+  const contentToken = await sha256Hex('direct|' + clean.text).then((h) => h.slice(0, 16));
+  const jobId = 'direct:' + contentToken + (lang === DEFAULT_LANG ? '' : ':' + lang);
+
+  // cached? (a re-cast of the same movie = zero quota)
+  const existing = await getJob(env, jobId);
+  if (existing && existing.status === 'done' && !o.fresh) return { job: existing, cached: true };
+
+  await kvPut(env, 'entext:' + jobId, clean.text);
+  await publishSrt(env, clean.text, { token: await deterministicToken('en', jobId), permanent: true });
+  const enToken = await deterministicToken('en', jobId);
+  const siToken = await deterministicToken('si', jobId);
+  const batches = makeBatches(enCues.length);
+  const job = {
+    id: jobId, type: 'direct', imdb: null, season: 0, episode: 0, status: 'translating',
+    source: 'ai', provider: chain[0], chain: chain.slice(), release: o.name || 'cast-subs',
+    cues: enCues.length, siToken, enToken, done: 0, total: batches.length, providers: [],
+    batchDone: batches.map(() => false), startedAt: Date.now(), createdAt: Date.now(), error: null,
+    lang, register, quality: 'base-nmt', polishStatus: 'pending',
+  };
+  await putJob(env, job);
+  await kvPut(env, 'subjob:' + siToken, jobId);
+  await kvPut(env, 'subjob:' + enToken, jobId);
+  const locked = await acquireLock(env, jobId);
+  if (!locked) return { job };
+  const started = resumeTranslationJob(env, jobId).finally(() => releaseLock(env, jobId)).catch(() => {});
+  return { job, started };
+}
+
 export {
-  PIPELINE_VERSION, DEFAULT_GEMINI_MODEL,
+  PIPELINE_VERSION,
   jobIdOf, JOB_ID_RE, deterministicToken, getJob, putJob, kvGet, kvPut,
+  acquireLock, releaseLock, heartbeatLock,
   cinemetaResolve, cinemetaMeta, flattenLikeAnantPlay, parseTsMs, buildPairedCues,
-  geminiKeyOf, geminiModelOf, geminiBaseOf, geminiTranslateBatch, translateBatchRobust,
   makeBatches, runPool, ensureSubtitleJob, resumeTranslationJob, getPaired, jobForToken,
+  translateDirectSub, translateBatchRobust, runCinemaPolish,
+  langJobIdOf, parseLangOf, langJobIdOf as jobLangIdOf,
 };

@@ -1,8 +1,8 @@
 {
   "name": "anantplay-si-subs-bridge",
-  "version": "3.0.0",
+  "version": "4.1.0",
   "private": true,
-  "description": "Real-HTTP .srt delivery + zero-fork Companion API for AnantPlay Sinhala subtitles (Cloudflare Worker + LAN local server)",
+  "description": "Multi-language (18) cinema-grade EN→X subtitle engine v4.1: translate-pa → azure → google_v3 → gemini → workers_ai failover, two-stage base-NMT + cinema polish, real-HTTP .srt delivery for AnantPlay (Cloudflare Worker + LAN local server)",
   "main": "worker/src/index.js",
   "type": "module",
   "engines": {
@@ -15,10 +15,17 @@
     "test:security": "node tests/security.test.js",
     "test:pipeline": "node tests/pipeline.test.js",
     "test:local": "python3 -m unittest discover -s tests -p 'local_server_test.py' -v",
-    "lab": "node lab/verify_worker_e2e.mjs",
+    "lab": "node lab/verify_worker_v4_e2e.mjs",
+    "lab:v3": "node lab/verify_worker_e2e.mjs",
+    "lab:v4": "node lab/verify_worker_v4_e2e.mjs",
     "lab:remote": "node lab/verify_worker_e2e.mjs --target https://anantplay-si-subs-bridge.techworldlk.workers.dev",
-    "syntax": "node --check worker/src/lib.js && node --check worker/src/pipeline.js && node --check worker/src/index.js && node --check bridge-ui/public/app.js && node --check lab/verify_worker_e2e.mjs && python3 -m py_compile local-server/server.py",
-    "deploy:dry": "wrangler deploy --dry-run"
+    "syntax": "node --check worker/src/lib.js && node --check worker/src/languages.js && node --check worker/src/cinema.js && node --check worker/src/pipeline.js && node --check worker/src/providers.js && node --check worker/src/index.js && node --check bridge-ui/public/app.js && node --check lab/verify_worker_e2e.mjs && node --check lab/verify_worker_v4_e2e.mjs && node --check lab/verify_worker_v41_e2e.mjs && node --check tests/run-all.js && python3 -m py_compile local-server/server.py",
+    "deploy:dry": "wrangler deploy --dry-run",
+    "lab:v41": "node lab/verify_worker_v41_e2e.mjs",
+    "test:providers": "node tests/providers.test.js",
+    "test:v41": "node tests/v41.test.js",
+    "scan:secrets": "! grep -rInE 'AIza[0-9A-Za-z_-]{20,}' --exclude-dir=node_modules --exclude-dir=.git --exclude-dir=.wrangler .",
+    "lab:all": "node lab/verify_worker_v4_e2e.mjs && node lab/verify_worker_v41_e2e.mjs"
   },
   "devDependencies": {
     "wrangler": "4.166.0"
