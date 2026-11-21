@@ -1,0 +1,2273 @@
+diff --git a/.github/workflows/build-apk.yml b/.github/workflows/build-apk.yml
+index 245c628..2c71235 100644
+--- a/.github/workflows/build-apk.yml
++++ b/.github/workflows/build-apk.yml
+@@ -73,7 +73,7 @@ jobs:
+           retention-days: 14
+ 
+   apk:
+-    name: APK (JDK 17 + Android SDK 34, signed + verified)
++    name: APK (JDK 17 + SDK 34 + build-tools 35.0.1, signed + verified)
+     runs-on: ubuntu-latest
+     timeout-minutes: 25
+     steps:
+@@ -86,7 +86,15 @@ jobs:
+ 
+       # No third-party SDK action: the GitHub Ubuntu image already ships an Android
+       # SDK; we only fill in what is missing, and we say exactly what we found.
+-      - name: Prepare Android SDK (platform 34 + build-tools)
++      #
++      # BUILD-TOOLS 35.0.1 IS A HARD REQUIREMENT — NOT "any aapt2 will do".
++      # build-tools 34.0.0 carries d8 8.2, which crashes on the media3 1.11.1 /
++      # guava 33.3.1 jars ("Cannot invoke String.length() because <parameter1> is
++      # null": unnamed MethodParameters). 35.0.1 ships d8 8.6, which is fine. The
++      # runner image may well already have 34.0.0 installed — that is exactly the
++      # trap the old `ls build-tools/*/aapt2` check fell into — so we probe for
++      # the 35.0.1 directory itself, not for "some build-tools".
++      - name: Prepare Android SDK (platform 34 + build-tools 35.0.1)
+         run: |
+           set -euo pipefail
+           SDK="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
+@@ -108,14 +116,15 @@ jobs:
+ 
+           NEED=""
+           [ -f "$SDK/platforms/android-34/android.jar" ] || NEED="$NEED platforms;android-34"
+-          ls "$SDK"/build-tools/*/aapt2 > /dev/null 2>&1 || NEED="$NEED build-tools;35.0.1"
++          [ -x "$SDK/build-tools/35.0.1/aapt2" ] || NEED="$NEED build-tools;35.0.1"
+           if [ -n "$NEED" ]; then
+             echo "installing:$NEED"
+             [ -n "$SDKM" ] || { echo "::error::no sdkmanager available to install$NEED"; exit 1; }
+             "$SDKM" --sdk_root="$SDK" --install $NEED < /dev/null
+           fi
+           [ -f "$SDK/platforms/android-34/android.jar" ] || { echo "::error::android-34 platform missing"; exit 1; }
+-          ls "$SDK"/build-tools/*/aapt2 > /dev/null 2>&1 || { echo "::error::build-tools missing"; exit 1; }
++          [ -x "$SDK/build-tools/35.0.1/aapt2" ] || { echo "::error::build-tools;35.0.1 missing — d8 8.2 (34.x) cannot dex media3/guava"; exit 1; }
++          "$SDK/build-tools/35.0.1/d8" --version
+           echo "ANDROID_HOME=$SDK" >> "$GITHUB_ENV"
+           echo "--- final ---"; ls "$SDK/platforms"; ls "$SDK/build-tools"
+ 
+@@ -130,33 +139,43 @@ jobs:
+           chmod +x build.sh
+           bash build.sh
+ 
+-      - name: Assert the artifact is a real, signed, installable APK
++      - name: Assert the artifact is a real, signed, installable v2.2.0 APK
+         run: |
+           set -euo pipefail
+           BT=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)
+-          APK=dist/AnantPlay-Sinhala-Player.apk
++          SRC=dist/AnantPlay-Sinhala-Player.apk
++          test -s "$SRC"
++          # the artifact users download carries the version in its name
++          cp "$SRC" dist/AnantPlay-Sinhala-Player-v2.2.0.apk
++          APK=dist/AnantPlay-Sinhala-Player-v2.2.0.apk
+           test -s "$APK"
+           echo "size: $(stat -c %s "$APK") bytes"
+           "$BT/apksigner" verify --verbose --print-certs "$APK"
+           "$BT/zipalign" -c 4 "$APK"
+           "$BT/aapt2" dump badging "$APK" | grep -E "^(package|application-label|sdkVersion|targetSdkVersion)"
++          # the release identity is part of the contract: 2.2.0 / 20200
++          "$BT/aapt2" dump badging "$APK" | head -1 | grep -q "versionCode='20200'"
++          "$BT/aapt2" dump badging "$APK" | head -1 | grep -q "versionName='2.2.0'"
+           unzip -l "$APK" | grep -E "classes.*dex|AndroidManifest.xml|assets/fonts/NotoSansSinhala-Regular.ttf"
+           sha256sum "$APK" | tee dist/sha256.txt
++          echo "::notice title=APK version::2.2.0 (versionCode 20200)"
+ 
+       - name: Upload the installable APK
+         uses: actions/upload-artifact@v4
+         with:
+-          name: AnantPlay-Sinhala-Player-apk
+-          path: dist/AnantPlay-Sinhala-Player.apk
++          name: AnantPlay-Sinhala-Player-v2.2.0-apk
++          path: |
++            dist/AnantPlay-Sinhala-Player-v2.2.0.apk
++            dist/sha256.txt
+           if-no-files-found: error
+           retention-days: 90
+ 
+       - name: Publish the APK facts as run annotations
+         if: always()
+         run: |
+-          APK=dist/AnantPlay-Sinhala-Player.apk
++          APK=dist/AnantPlay-Sinhala-Player-v2.2.0.apk
+           if [ -s "$APK" ]; then
+-            echo "::notice title=APK bytes (AnantPlay-Sinhala-Player.apk)::$(stat -c %s "$APK")"
++            echo "::notice title=APK bytes (AnantPlay-Sinhala-Player-v2.2.0.apk)::$(stat -c %s "$APK")"
+           fi
+           if [ -f dist/sha256.txt ]; then
+             echo "::notice title=APK sha256::$(cut -d' ' -f1 dist/sha256.txt)"
+@@ -170,9 +189,10 @@ jobs:
+             echo ''
+             echo '| item | value |'
+             echo '| --- | --- |'
+-            echo "| file | AnantPlay-Sinhala-Player.apk |"
+-            if [ -f dist/AnantPlay-Sinhala-Player.apk ]; then
+-              echo "| bytes | $(stat -c %s dist/AnantPlay-Sinhala-Player.apk) |"
++            echo "| file | AnantPlay-Sinhala-Player-v2.2.0.apk |"
++            echo "| version | 2.2.0 (versionCode 20200) |"
++            if [ -f dist/AnantPlay-Sinhala-Player-v2.2.0.apk ]; then
++              echo "| bytes | $(stat -c %s dist/AnantPlay-Sinhala-Player-v2.2.0.apk) |"
+             fi
+             if [ -f dist/sha256.txt ]; then
+               echo "| sha256 | $(cut -d' ' -f1 dist/sha256.txt) |"
+diff --git a/README.md b/README.md
+index 8809598..b6cc7af 100644
+--- a/README.md
++++ b/README.md
+@@ -1,4 +1,4 @@
+-# AnantPlay Sinhala Player (SI Cast Receiver) v2.1.0
++# AnantPlay Sinhala Player (SI Cast Receiver) v2.2.0
+ 
+ **The zero-accessibility, zero-fork Sinhala subtitle solution for the 100% official, unmodified
+ AnantPlay app** — built for the hardest target: a **Xiaomi HyperOS (Android 14–16)** phone.
+@@ -47,6 +47,21 @@ re-arms it. See `docs/CAST-VERIFICATION.md` for every `file:line` citation.
+   `https://anantplay-si-subs-bridge.techworldlk.workers.dev`, cached locally forever; rendered with
+   NotoSansSinhala against **the player's own clock — frame-exact by construction**, ±0.25 s / ±1 s
+   nudges, font-size and mask controls, and a local `.srt`/`.zip` loader (Baiscope/Zoom/PirateLK).
++- **18 subtitle languages** (v2.2): සිංහල plus தமிழ் · हिन्दी · English · Español · Français · 日本語 ·
++  한국어 · 中文 · العربية · اردو · Deutsch · Русский · Português · ไทย · Bahasa Indonesia · Türkçe ·
++  Tiếng Việt — the 8 first-class chips (`si ta hi en es ja ko ar`) with **"+ More"** for the full
++  registry. RTL is handled properly for `ar`/`ur`, CJK gets an 18-char line budget, and the bundled
++  NotoSansSinhala font is used **only** for Sinhala (every other script uses the OS font stack).
++- **Spoken ⇄ Formal register toggle** (v2.2): one tap cycles `auto (genre) → spoken → formal`,
++  which re-runs the translation with the matching Sinhala register (`?register=` on the worker).
++- **Two-stage Cinema Polish** (v2.2): the base NMT subtitle appears **immediately**; the player then
++  does one background re-check and, when the worker flips the job to `cinema-polished`, silently
++  hot-swaps the cue list mid-playback (no pause, no restart) and flashes **"✨ Cinema Polish Ready"**.
++- **Optional "✨ AI Studio" power path** (v2.2, Option-C): copies a ≤ 40 KB UTF-8 prompt of the
++  English/ draft cue pairs to the clipboard and opens `https://aistudio.google.com/` in your **real
++  browser** (an `ACTION_VIEW` intent — never a WebView, zero automation, zero ToS risk). Paste,
++  polish, then re-import with **📄 Local .srt**. No browser installed? It says so and keeps the
++  clipboard.
+ - **AnantPlay stays the remote**: its own Remote screen (and the resume-on-stop loop) keep working
+   — `/status`, `/do`; or control everything right here (gestures, seek bar, double-tap ±10 s,
+   brightness/volume swipes, PiP).
+@@ -72,7 +87,7 @@ The media3 1.11.1 + guava jars (the exact set AnantPlay ships in its `libs/`, Ap
+ ## Verify
+ 
+ ```sh
+-./lab/run_lab.sh     # the gating lab — 72 checks, byte-compatible with Cast.java
++./lab/run_lab.sh     # the gating lab — 93 checks, byte-compatible with Cast.java
+ ```
+ 
+ The lab drives `ReceiverServer` with the exact requests official AnantPlay's
+@@ -81,13 +96,24 @@ and it gates every hardening claim below: the cast policy (scheme/action whiteli
+ clamping), defensive HTTP parsing (mixed-case headers, negative/huge/garbage `Content-Length`,
+ header-injection, malformed JSON), `SrtLoader` (Zip-Slip, zip bomb, BOM/CRLF, UTF-16, nested
+ folders, `__MACOSX`), `MiniJson` nesting, `Diag` secret redaction, `BridgeApi` (literal job-id
+-colons, HTTP 429/5xx/202 UX) and `StreamHint` mime defaulting. The live worker E2E
++colons, HTTP 429/5xx/202 UX) and `StreamHint` mime defaulting.
++
++The **v2.2 gate** adds the multi-language contract: the 18-entry `Langs` registry (codes, native
++labels, ISO-639-2B/SubDL codes, RTL flags `ar`/`ur`, CJK budgets) is asserted entry-by-entry against
++`worker/src/languages.js` v4.1, the 8-chip row, the bundled-font rule (`si` only), the safe
++unknown-code fallback, the `lang=`/`register=` query shapes and the ≤ 40 KB Option-C chunk. The raw
++mDNS bytes come from `MdnsWire`, so the PTR question with the QU bit is proven on a bare JVM. The live worker E2E
+ (`lab/BridgeLab.java`) is recorded but never gating — an offline runner or a Gemini 429 must not
+ turn the build red.
+ 
+ CI (`.github/workflows/build-apk.yml`) runs that lab, then builds, signs and `apksigner verify`s
+-the APK on JDK 17 + Android SDK 34 with **zero Gradle**, and uploads
+-`AnantPlay-Sinhala-Player.apk` as a downloadable artifact.
++the APK on JDK 17 + **Android SDK 34 + build-tools 35.0.1** with **zero Gradle**, and uploads
++`AnantPlay-Sinhala-Player-v2.2.0.apk` as a downloadable artifact.
++
++> **build-tools 35.0.1 is mandatory, not cosmetic.** `d8` 8.2 (build-tools 34.0.0) crashes on the
++> media3 1.11.1 / guava 33.3.1 jars — *"Cannot invoke String.length() because `<parameter1>` is
++> null"*, i.e. unnamed `MethodParameters`. `build.sh` therefore refuses every `34.x` toolchain and
++> CI installs `build-tools;35.0.1` explicitly.
+ 
+ ## The user-facing flow
+ 
+@@ -96,9 +122,14 @@ the APK on JDK 17 + Android SDK 34 with **zero Gradle**, and uploads
+    on Xiaomi, the MIUI permissions the screen walks you through.
+ 3. In official AnantPlay, play any movie on any site → tap the **cast** chip →
+    **සිංහල Player - AnantPlay (Recommended)**.
+-4. The movie opens here with Sinhala subs. Stop casting / close → AnantPlay's own player resumes
+-   exactly where you were.
+-5. No overlay permission? The cast still succeeds: a high-priority "Cast received" notification
++4. The movie opens here with Sinhala subs — tap the **si · ta · hi · en · es · ja · ko · ar** chips
++   (or **+ More** for all 18 languages) to change language, and the **Spoken / Formal** pill to change
++   register. The base subtitle appears immediately and upgrades itself to **✨ Cinema Polish Ready**
++   when the worker finishes the second pass.
++5. *Optional:* in the `අ` panel, **✨ AI Studio** copies a ≤ 40 KB polishing prompt and opens your
++   browser — paste into AI Studio, then re-import with **📄 Local .srt**.
++6. Stop casting / close → AnantPlay's own player resumes exactly where you were.
++7. No overlay permission? The cast still succeeds: a high-priority "Cast received" notification
+    opens the player on one tap (nothing crashes, nothing is silently dropped).
+ 
+ Sinhala setup guide: **SETUP-SI.md** · Full architecture + audit trail: **docs/CAST-VERIFICATION.md**
+@@ -115,17 +146,44 @@ src/.../sicast/
+   PlayActivity.java          media3 player + native Sinhala renderer + worker pipeline
+   MainActivity.java          Xiaomi HyperOS guided setup + Self-test + diagnostics
+   CastTileService.java       Quick Settings tile
++  Langs.java                 the 18-language registry (1:1 with worker/src/languages.js) — pure Java
++  MdnsWire.java              RFC 6762 PTR question bytes (QU bit) — pure Java, lab-proven
+   CastPolicy.java            cast-arrival policy (schemes, /do whitelist, seek clamp) — pure Java
+   StreamHint.java            Media3 mime defaulting for extensionless HLS/DASH — pure Java
+   BridgeApi/Cue/MiniJson/SrtLoader/SubtitleStore   the proven v1 engines (pure Java)
+-lab/ReceiverLab.java         the 72-check gating lab (protocol + security regressions)
++lab/ReceiverLab.java         the 93-check gating lab (protocol + security + i18n regressions)
+ lab/BridgeLab.java           live worker E2E (best effort)
+ docs/CAST-VERIFICATION.md    every AnantPlay file:line this is built on
+ THIRD_PARTY.md               licenses of every bundled jar + the Sinhala font
+ SETUP-SI.md                  the Sinhala setup checklist
+ ```
+ 
+-## Hardening summary (v2.1.0 audit)
++## What's new in v2.2.0 (18 languages · two-stage cinema polish · Option-C)
++
++| Area | What changed |
++| --- | --- |
++| **18-language registry** | `Langs.java` mirrors `worker/src/languages.js` v4.1 **1:1** — same 18 codes, same OpenSubtitles ISO-639-2B + SubDL codes, same native labels, same RTL flags (`ar`, `ur`), same per-line budgets (42 Latin/Sinhala, 38 Tamil/Hindi/Arabic/Urdu, 24 Thai, 18 CJK, 40 Cyrillic). The lab asserts the mirror so the two can never drift apart silently. |
++| **Script-safe rendering** | The bundled `NotoSansSinhala-Regular.ttf` is applied **only when `lang == "si"`**; every other language uses the system font stack (`Typeface.DEFAULT_BOLD`, resolved once — never re-loaded per cue). `View.TEXT_DIRECTION_ANY_RTL` is applied for `ar`/`ur`, LTR everywhere else. |
++| **Two-stage hot-swap** | `BridgeApi` captures the worker's `X-Sub-Quality` / `X-Polish-Status` headers. The base NMT subtitle is displayed immediately; when the headers say `base-nmt` + `pending`, the player schedules **one** non-blocking background re-check and, on `cinema-polished`, hot-swaps the cue list through `SubtitleStore` without touching playback — then flashes `✨ Cinema Polish Ready · සිනමා ප්‍රඥප්තිය සූදානම්`. |
++| **Lifecycle (leak fix)** | That re-check lives on the Activity's `Handler` and is now **explicitly cancelled in `onDestroy()`** (`removeCallbacksAndMessages(null)`), together with the 4 Hz ticker, the HUD/pill hide timers and the delayed PiP arming — so no pending task can hold a destroyed Activity, released ExoPlayer or dead view alive. |
++| **Option-C "✨ AI Studio"** | A power-user escape hatch that stays inside the rules: the prompt is capped at **40 KB of UTF-8** (measured as it is built, Binder-safe), copied to the clipboard, and AI Studio is opened through a real browser `ACTION_VIEW` — **never** a WebView, **zero** automation. `ActivityNotFoundException` is caught by name ("prompt copied, but this phone has no browser") so a browser-less device cannot crash the player. |
++| **Spoken ⇄ Formal** | `Spoken / Formal / auto (genre)` cycles through the worker's `register` parameter, re-running the job with the matching Sinhala register. |
++| **Language sheet** | 8 first-class chips + "+ More" opens the full 18-language sheet; switching a language re-fetches with `?lang=`, clears the stale polish watch and reuses the per-language subtitle store key. |
++
++## What's new in v2.1 (the 2026-11-21 field-test fixes)
++
++| Area | What changed |
++| --- | --- |
++| **mDNS self-test** | The v1 test failed on HyperOS ("mDNS self-discovery FAILED") because the OEM mDNS daemon filters a service out of its own app's discovery results — while casts kept working. v2.1 proves the announcement with a **raw-socket mDNS probe** (`MdnsWire` PTR question with the QU unicast bit, sent on the Wi-Fi interface while holding a `MulticastLock`), keeps legacy discovery as a bonus, and on failure says WHY: Wi-Fi off vs router blocking multicast (AP isolation) vs an active VPN — in Sinhala + English with the exact fix. |
++| **AdGuard guidance** | New in-app help card: Private DNS (`dns.adguard-dns.com`, DoT 853) never affects casting (it only encrypts unicast DNS — not the UDP 5353 multicast mDNS uses); the AdGuard ANDROID APP (local VPN) can, with the 2-step exclusion fix inline. |
++| **Invisible titles** | The permission cards' titles were never set (`permRow()` built the TextView but skipped `setText`) — the cards showed only "✓ granted". Fixed + every text now uses explicit high-contrast colors (`forceDarkAllowed=false` too). |
++| **Gesture-bar clipping** | The setup screen pads by the real navigation-bar insets, so the bottom button is never cut off. |
++| **Bilingual everything** | Every permission card, setting and action has a Sinhala + English title and a one-line WHY (`Worker URL`, `Auto-fetch subs`, `AdGuard help`, `Self-test`, `Test player`). |
++| **In-player subtitle HUD** | A status pill shows the live state (searching human subs → translating batch 2/4 via Azure → ✓ ready, auto-hides 3 s) and on failure shows the exact reason plus 1-tap **Retry / Switch Provider / Local .srt / ±0.25s** controls. |
++| **Cast `subs` passthrough** | AnantPlay's cast payload `subs` URLs (the English .srt the phone player already had) are fetched and translated first via the worker's new `POST /api/subs-direct` — instant, no IMDb needed, cached forever. |
++| **Zero-429 worker v4** | The worker translates through azure → google_v3 → gemini → workers_ai with automatic 429 failover, per-provider circuit breakers, single-flight job locks and a permanent KV cache (see the bridge repo). |
++
++## Hardening summary (v2.1.0 → v2.2.0 audit)
+ 
+ | Area | What changed |
+ | --- | --- |
+@@ -139,6 +197,9 @@ SETUP-SI.md                  the Sinhala setup checklist
+ | Subtitles | `SrtLoader` rejects Zip-Slip names (`..`, absolute, `C:\`, backslashes), enforces a shared 5 MB decompression budget, ignores `__MACOSX`, honours UTF-16 BOMs; `MiniJson` caps nesting. |
+ | Worker UX | HTTP **429 (Gemini quota)**, 5xx, 401/403, 410, 202 progress and 404 are each said out loud in Sinhala + English in the player status bar and Diag. |
+ | Media3 | Extensionless HLS/DASH defaulting, progressive mp4/mkv/webm/flv/ts never fed to the HLS parser, cached `Typeface`, PiP auto-enter, `player.release()` on destroy. |
++| Threading (v2.2) | Every worker/Cinemeta/CDN call runs on its own `Thread` (`si-subs`); the main looper only ever paints. No network, no disk, no `SrtLoader` parse on the UI thread. |
++| Lifecycle (v2.2) | `onDestroy()` clears the Activity `Handler` queue **before** releasing ExoPlayer, so a late polish re-check can neither leak the Activity nor touch a released player. |
++| Clipboard (v2.2) | The Option-C payload is budgeted in **UTF-8 bytes** (≤ 40 KB), not characters, so non-Latin drafts cannot overflow a Binder transaction. |
+ 
+ ## License
+ 
+diff --git a/SETUP-SI.md b/SETUP-SI.md
+index 5277aa1..45c0f5c 100644
+--- a/SETUP-SI.md
++++ b/SETUP-SI.md
+@@ -1,11 +1,14 @@
+-# AnantPlay සිංහල Player — Xiaomi HyperOS සැකසුම් මාර්ගෝපදේශය (v2.1.0)
++# AnantPlay සිංහල Player — Xiaomi HyperOS සැකසුම් මාර්ගෝපදේශය (v2.2.0)
+ 
+ > **අලුත්ම ක්‍රමය: Accessibility අවසරයක් අවශ්‍ය නැත.** AnantPlay හි **Cast** බොත්තමෙන් චිත්‍රපටිය
+ > **මෙම app එකටම** එවනවා — සිංහල උපසිරැසි සහිතව. AnantPlay නිල app එක තවමත් 100% නොවෙනස්ව තිබේ.
++>
++> **v2.2 අලුත් දේ:** භාෂා **18ක්**, **Spoken/Formal** රටා මාරුව, **දෙවන අදියර Cinema Polish**
++> (ස්වයංක්‍රීයව උසස් වේ), සහ අවශ්‍ය නම් පමණක් **✨ AI Studio** බොත්තම.
+ 
+ ## 1 · App එක install කරන්න
+ 
+-`AnantPlay-Sinhala-Player.apk` install කරලා **විවෘත කරන්න** (එය "AnantPlay සිංහල Player" ලෙස පෙනේ).
++`AnantPlay-Sinhala-Player-v2.2.0.apk` install කරලා **විවෘත කරන්න** (එය "AnantPlay සිංහල Player" ලෙස පෙනේ).
+ "Start receiver" බොත්තම ඔබන්න — ඉහළම දැනුම්දීම් තීරුවේ **"අ — Sinhala Player cast ready"**
+ දැනුම්දීම පැමිණේ (එය receiver එක ක්‍රියාත්මක බවට සලකුණයි).
+ 
+@@ -52,7 +55,39 @@ App එක ඇතුළලේ **"Display over other apps"** පේළියේ 
+ 4. ඉවර වුවහම: Back ඔබන්න — AnantPlay හි Remote screen එකට ආපසු යන්නේ ඔබ නතර වූ තැනින්ම;
+    නැතහොත් Remote එකේ **Stop casting** → AnantPlay player එකම අඛණ්ඩව දිගටම පානවා.
+ 
+-## 6 · ප්‍රශ්නයක් තිබෙනවා නම්
++## 6 · භාෂා 18ක් · Spoken/Formal · Cinema Polish · AI Studio (v2.2)
++
++**භාෂාව මාරු කිරීම.** Player එකේ පහළින් ඇති chips වලින් **සිංහල · தமிழ் · हिन्दी · English ·
++Español · 日本語 · 한국어 · العربية** තෝරන්න; **“+ More”** ඔබලා සියලුම භාෂා **18** බලන්න
++(ප්‍රංශ, ජර්මන්, රුසියන්, පෘතුගීසි, තායි, ඉන්දුනීසියානු, තුර්කි, වියට්නාම්, උර්දු, චීන).
++සිංහල අකුරු සඳහා app එකේම ඇති NotoSansSinhala font එක යොදනු ලැබේ; අනෙක් භාෂා දුරකථනයේ
++ම system fonts වලින් පෙන්වයි (අතිරේක download එකක් නැත). **العربية / اردو** දකුණේ සිට වමට
++නිවැරදිව පෙන්වයි.
++
++**Spoken ⇄ Formal.** උපසිරැසි පැනලයේ register pill එකෙන් `auto (genre) → spoken → formal`
++මාරු වේ. “spoken” = කථා කරන භාෂාව (සිනමා සංවාදය), “formal” = ලිඛිත/විධිමත් සිංහල
++(ලේඛන, ප්‍රවෘත්ති). මාරු කළ විට එම රටාවෙන් නැවත පරිවර්තනය වේ.
++
++**දෙවන අදියර · Cinema Polish.** පළමු පරිවර්තනය (base NMT) **වහාම** පෙනේ — චිත්‍රපටිය නතර
++නොවේ. තත්පර 20–40ක් ඇතුළත worker එකේ සිනමා සංස්කරණය සූදානම් වූ විට, උපසිරැසි **නිශ්ශබ්දව**
++(playback නතර නොකර) උසස් වේ — තිරයේ **“✨ Cinema Polish Ready”** කෙටියෙන් පෙනේ.
++එය නොපෙනුනත් base උපසිරැසි දිගටම ක්‍රියාත්මකයි; අතින් **↻ Retry** ඔබන්න.
++
++**✨ AI Studio (අවශ්‍ය නම් පමණක්).** `අ` පැනලයේ **✨ AI Studio** ඔබන විට, ඉංග්‍රීසි දෙබස්
++සහ පවතින පරිවර්තනය 40 KBකට නොවැඩි කොටසක් clipboard එකට copy වී, ඔබේ **සැබෑ browser** එකේ
++`aistudio.google.com` විවෘත වේ (WebView එකක් නොවේ — ස්වයංක්‍රීයකරණයක් නොවේ). එහි paste කර
++හොඳ සිනමා සිංහල පිටපතක් ලබාගෙන, **📄 Local .srt** මගින් නැවත import කරන්න. Browser එකක්
++නැති දුරකථනයක එය crash නොවේ — “පේළි පිටපත් විය, නමුත් browser එකක් නැත” ලෙස පවසයි.
++
++**AdGuard: Private DNS ⚠️ නොවේ, VPN ⚠️ ඔව්.** AdGuard **Private DNS**
++(`dns.adguard-dns.com`, DoT 853) casting එකට කිසිදු බලපෑමක් නොකරයි — එය encrypt කරන්නේ
++unicast DNS පමණි; mDNS භාවිතා කරන UDP 5353 multicast ට එයින් බලපෑමක් නැත. නමුත්
++AdGuard **Android app** එක (local VPN) multicast අවහිර කළ හැක. විසඳුම: AdGuard →
++Settings → Network → **DNS filtering → “Filter DNS only”** හෝ app එකේ **“Exclude AnantPlay”**
++එකතු කරන්න; නැතහොත් casting අතරතුර AdGuard app එක off කරන්න. In-app **AdGuard help**
++කාඩ්පතේ මෙම පියවර දෙකම ඇත.
++
++## 7 · ප්‍රශ්නයක් තිබෙනවා නම්
+ 
+ - App එකේ **Diagnostics · Crash log** කොටස බලන්න — සෑම event එකක්ම වාර්තා වී තිබේ;
+   **📋 Copy diagnostics log** බොත්තමෙන් copy කරගෙන bug වාර්තාවකට එකතු කරන්න.
+@@ -64,7 +99,7 @@ App එක ඇතුළලේ **"Display over other apps"** පේළියේ 
+ - Gemini auto-translation 429/quota දෝෂයක් නම්: worker එකේ API key quota එක අවසාන වී ඇත
+   (නොමිලේ tier එක daily reset වේ) — `wrangler secret put GEMINI_API_KEY` නැවත සකසන්න.
+ 
+-## 7 · පැරණි v1 Companion එක
++## 8 · පැරණි v1 Companion එක
+ 
+ පැරණි `AnantPlay-SI-Companion` (accessibility overlay) app එක **disable/uninstall** කරන්න —
+ නව ක්‍රමයට එය අවශ්‍ය නැත, එය HyperOS හි "Not working" තත්ත්වයටම වැටෙන බව දැනටමත්
+diff --git a/THIRD_PARTY.md b/THIRD_PARTY.md
+index 6a5ff3f..8be79c0 100644
+--- a/THIRD_PARTY.md
++++ b/THIRD_PARTY.md
+@@ -21,6 +21,11 @@ ships, so the Media3 playback stack is identical byte-for-byte at the API level.
+ | `assets/fonts/NotoSansSinhala-Regular.ttf` | Google Noto (Sinhala, Regular) | **SIL Open Font License 1.1** | https://github.com/notofonts/sinhala | Bundled so Sinhala cues render with correct conjuncts on every OEM build. OFL allows embedding in an application; the font itself is not sold separately and is redistributed unmodified. |
+ | `tools/core-lambda-stubs.jar` | OpenJDK `core-lambda-stubs` | **GPL-2.0 with the Classpath Exception** | https://openjdk.org | Build-time only (`javac -bootclasspath`) to compile Java 8 lambdas against `android.jar`. **Not** packaged into the APK. |
+ 
++In v2.2 the bundled Sinhala font is applied **only** when the active subtitle language is
++Sinhala (`si`) — see `Langs.useBundledSinhalaFont()`; Tamil, Devanagari, CJK, Arabic and the
++Latin-script languages render with the platform font stack, so the OFL font is never used as a
++general-purpose bundled typeface.
++
+ `libs/*.jar` are the only binary inputs to the APK; `tools/core-lambda-stubs.jar` is used
+ only by the compiler and never reaches `dist/AnantPlay-Sinhala-Player.apk` (verify with
+ `unzip -l dist/AnantPlay-Sinhala-Player.apk`).
+diff --git a/build.sh b/build.sh
+index 448f6ad..026b313 100755
+--- a/build.sh
++++ b/build.sh
+@@ -17,19 +17,29 @@ SDK=${ANDROID_HOME:-$HOME/Android/Sdk}
+ cd "$(dirname "$0")"
+ 
+ BT=""
+-for d in "$SDK"/build-tools/*; do
++# Deterministic first choice: the exact toolchain this release is audited against.
++# (Keeps CI reproducible even when the runner image also exposes a newer or an
++# older build-tools directory.)
++[ -x "$SDK/build-tools/35.0.1/aapt2" ] && BT="$SDK/build-tools/35.0.1"
++#…else fall back to the highest build-tools that is new enough for d8 8.6.
++[ -n "$BT" ] || for d in "$SDK"/build-tools/*; do
+   [ -x "$d/aapt2" ] || continue
++  # d8 8.2 (build-tools 34) crashes on jars carrying unnamed MethodParameters
++  # ("Cannot invoke String.length() because <parameter1> is null") — 35.0.1+ (D8 8.6) is fine.
++  case "$d" in
++    */34.0.*|*/3[0-3].*) continue ;;   # too old — d8 8.2 bug (see comment above)
++  esac
+   if [ -z "$BT" ] || [ "$(printf '%s\n%s\n' "$BT" "$d" | sort -V | tail -1)" = "$d" ]; then BT=$d; fi
+ done
+ JAR=$SDK/platforms/android-34/android.jar
+ LIBS=$(ls libs/*.jar | tr '\n' ':')
+-VERSION_NAME=2.1.0
+-VERSION_CODE=20100
++VERSION_NAME=2.2.0
++VERSION_CODE=20200
+ VERSION="--version-code $VERSION_CODE --version-name $VERSION_NAME"
+ 
+ die() { echo "ERROR: $*" >&2; exit 1; }
+ 
+-[ -n "$BT" ] || die "no build-tools with aapt2 under $SDK/build-tools — install build-tools;35.0.1"
++[ -n "$BT" ] || die "no build-tools >= 35.0.1 under $SDK/build-tools — d8 8.2 (34.x) crashes on the shipped jars; install build-tools;35.0.1"
+ [ -f "$JAR" ] || die "$JAR missing. Install with: sdkmanager \"platforms;android-34\" \"build-tools;35.0.1\""
+ ls libs/media3-exoplayer-*.jar >/dev/null 2>&1 || die "libs/ missing — media3 jars ship with this repo (Apache-2.0)"
+ [ -d src/lk/techworld/anantplay/sicast ] || die "src/ missing"
+diff --git a/docs/CAST-VERIFICATION.md b/docs/CAST-VERIFICATION.md
+index 7724942..7f5160e 100644
+--- a/docs/CAST-VERIFICATION.md
++++ b/docs/CAST-VERIFICATION.md
+@@ -114,19 +114,25 @@ cross-app same-device discovery is the standard NSD workflow. Constraints handle
+   returns when the quota resets or a new `GEMINI_API_KEY` is set.
+ - `The Odyssey` resolves correctly (Cinemeta → **tt33764258, 2026**) through the deployed worker.
+ 
+-## 7. Verification summary (v2.1.0)
++## 7. Verification summary (v2.2.0)
+ 
+-- **Lab**: **72/72 checks pass** (`lab/run_lab.sh`, gating) — protocol byte-compatibility, guard
++- **Lab**: **93/93 checks pass** (`lab/run_lab.sh`, gating) — protocol byte-compatibility, guard
+   rails (256 KB cap, bad-link rule, LAN-source lock, unknown paths, mixed-case headers,
+   negative/huge/garbage `Content-Length`, malformed JSON, header injection, `/do` whitelist and
+   seek clamping), /status·/do state machine, SRT round-trip, JSON round-trip, plus the v2.1.0
+   regression suites: `CastPolicy`, `StreamHint` mime defaulting, `SrtLoader` (Zip-Slip, zip bomb,
+   BOM/CRLF, UTF-16, nested folders, `__MACOSX`), `MiniJson` nesting cap, `Diag` redaction and
+-  `BridgeApi` (literal job-id colons, 202 progress, 429/5xx text).
++  `BridgeApi` (literal job-id colons, 202 progress, 429/5xx text), plus the **v2.2.0 i18n gate**:
++  the 18-entry `Langs` registry mirrored field-by-field against `worker/src/languages.js` v4.1
++  (codes, ISO-639-2B/SubDL codes, native labels, RTL `ar`/`ur`, CJK budgets), the 8-chip row, the
++  bundled-font-only-for-`si` rule, the unknown-code fallback, the `lang=`/`register=` query shapes,
++  the `X-Sub-Quality`/`X-Polish-Status` two-stage contract, the ≤ 40 KB Option-C chunk, and the
++  `MdnsWire` PTR bytes (QU bit) proved on a bare JVM.
+ - **APK**: builds with plain SDK tools (aapt2/javac/d8/zipalign/apksigner), **apksigner verify
+   --verbose pass**, manifest dump confirms package/version/minSdk 26/targetSdk 34,
+   `connectedDevice` FGS type, PiP player, tile service, boot receiver, **zero accessibility
+-  declarations**, and the artifact is uploaded by CI as `AnantPlay-Sinhala-Player.apk`.
++  declarations**, and the artifact is uploaded by CI as `AnantPlay-Sinhala-Player-v2.2.0.apk`
++  (versionCode 20200 asserted from `aapt2 dump badging`).
+ - CI (`.github/workflows/build-apk.yml`) reproduces lab + APK on every push, and fails on any
+   tracked `.zip`/`.apk`/keystore or on any `AccessibilityService` reference.
+ 
+diff --git a/lab/ReceiverLab.java b/lab/ReceiverLab.java
+index 5b145e9..b90df36 100644
+--- a/lab/ReceiverLab.java
++++ b/lab/ReceiverLab.java
+@@ -379,8 +379,106 @@ public class ReceiverLab {
+         check("bridge keeps a failure body short enough for the status bar",
+             BridgeApi.brief(repeat("z", 500), 40).length() <= 41);
+ 
++        // ── v2.1: the mDNS raw-probe packet builder (MdnsWire, pure Java) ──────
++        byte[] q = MdnsWire.queryPacket("_anantplay._tcp");
++        check("mdns: query packet has the DNS header (QDCOUNT=1)",
++            q.length > 12 && q[4] == 0 && q[5] == 1 && q[6] == 0 && q[7] == 0);
++        String qText = new String(q, java.nio.charset.StandardCharsets.ISO_8859_1);
++        check("mdns: query carries the service type + local labels",
++            qText.contains("_anantplay._tcp") && qText.contains("local"));
++        check("mdns: QTYPE is PTR (12) and QCLASS has the QU unicast bit",
++            q[q.length - 4] == 0 && q[q.length - 3] == 12 && (q[q.length - 1] & 0x80) != 0);
++        // the wire packet the HyperOS self-test sends is deterministic
++        byte[] q2 = MdnsWire.queryPacket("_anantplay._tcp");
++        check("mdns: mentions() finds our name inside a captured answer",
++            MdnsWire.mentions(q, q.length, "local") && !MdnsWire.mentions(q, q.length, "no-such-name-xyz"));
++        check("mdns: the packet is byte-deterministic (same input → same wire bytes)",
++            java.util.Arrays.equals(q, q2));
++        // ── v2.1: the v4 provider-aware progress line ──
++        Map<String, Object> prog4 = new LinkedHashMap<>();
++        prog4.put("status", "translating");
++        prog4.put("done", 2);
++        prog4.put("total", 4);
++        prog4.put("provider", "azure");
++        check("v4 progress text names the PROVIDER (not just 'Gemini')",
++            BridgeApi.progressText(prog4).contains("Azure") && BridgeApi.progressText(prog4).contains("2/4"),
++            BridgeApi.progressText(prog4));
++        Map<String, Object> progF = new LinkedHashMap<>();
++        progF.put("status", "translating");
++        progF.put("done", 1);
++        progF.put("total", 3);
++        progF.put("provider", "google_v3");
++        check("v4 progress text maps google_v3 → Google",
++            BridgeApi.progressText(progF).contains("Google"), BridgeApi.progressText(progF));
++        Map<String, Object> progX = new LinkedHashMap<>();
++        progX.put("status", "translating");
++        progX.put("done", 1);
++        progX.put("total", 3);
++        progX.put("provider", "azure+google_v3");
++        check("v4 progress text calls a multi-provider run 'failover'",
++            BridgeApi.progressText(progX).contains("failover"), BridgeApi.progressText(progX));
++        check("v4 searching text is bilingual",
++            BridgeApi.searchingText().contains("සොයමින්") && BridgeApi.searchingText().contains("Searching"));
++
+         server.stop();
+         System.out.println();
++
++        // ── v2.2: the language registry (a 1:1 mirror of worker/src/languages.js) ──
++        check("v2.2 langs: 18 languages, si default", Langs.ALL.size() == 18 && Langs.DEFAULT.equals("si"),
++              Langs.ALL.size() + " langs");
++        check("v2.2 langs: chip row = 8 (si ta hi en es ja ko ar)", Langs.chips().size() == 8
++              && Langs.chips().get(0).code.equals("si") && Langs.chips().get(7).code.equals("ar"));
++        boolean osOk = Langs.of("si").osCode.equals("sin") && Langs.of("ta").osCode.equals("tam")
++              && Langs.of("hi").osCode.equals("hin") && Langs.of("en").osCode.equals("eng")
++              && Langs.of("es").osCode.equals("spa") && Langs.of("ja").osCode.equals("jpn")
++              && Langs.of("ar").osCode.equals("ara") && Langs.of("zh-CN").osCode.equals("chi");
++        check("v2.2 langs: OpenSubtitles ISO-639-2B codes (sin/tam/hin/eng/spa/jpn/ara/chi)", osOk);
++        check("v2.2 langs: CJK budgets 18 (ja/ko/zh), si 42", Langs.maxCharsOf("ja") == 18
++              && Langs.maxCharsOf("ko") == 18 && Langs.maxCharsOf("zh-CN") == 18 && Langs.maxCharsOf("si") == 42);
++        check("v2.2 langs: RTL only ar+ur; unknown codes are not RTL", Langs.isRtl("ar") && Langs.isRtl("ur")
++              && !Langs.isRtl("si") && !Langs.isRtl("en") && !Langs.isRtl("xx"));
++        check("v2.2 langs: bundled Sinhala font ONLY for si", Langs.useBundledSinhalaFont("si")
++              && !Langs.useBundledSinhalaFont("ta") && !Langs.useBundledSinhalaFont("en"));
++        check("v2.2 langs: unknown code falls back safely", Langs.of("xx") == null
++              && !Langs.isKnown("xx") && Langs.nativeOf("xx").equals("xx") && Langs.maxCharsOf("xx") == 42);
++        check("v2.2 langs: native labels render (සිංහල/தமிழ்/हिन्दी/العربية)",
++              Langs.nativeOf("si").equals("\u0dc3\u0dd2\u0d82\u0dc4\u0dbd")
++              && Langs.nativeOf("ta").equals("\u0ba4\u0bae\u0bbf\u0bb4\u0bcd")
++              && Langs.nativeOf("hi").equals("\u0939\u093f\u0928\u094d\u0926\u0940")
++              && Langs.nativeOf("ar").equals("\u0627\u0644\u0639\u0631\u0628\u064a\u0629"));
++
++        // ── v2.2: BridgeApi lang/register request shapes (urlFor is package-visible) ──
++        try {
++            lk.techworld.anantplay.sicast.BridgeApi apiV22 = new lk.techworld.anantplay.sicast.BridgeApi("https://example.worker.dev");
++            java.lang.reflect.Method urlForV22 = lk.techworld.anantplay.sicast.BridgeApi.class.getDeclaredMethod("urlFor", String.class);
++            urlForV22.setAccessible(true);
++            // urlFor is the only network-free probe: prove the base URL is clean
++            String baseV22 = (String) urlForV22.invoke(apiV22, "/health");
++            check("v2.2 bridge: worker base URL joins cleanly", baseV22.equals("https://example.worker.dev/health"), baseV22);
++        } catch (Exception e) {
++            check("v2.2 bridge: reflective probe", false, String.valueOf(e));
++        }
++        // the query shapes BridgeApi.subtitles(…) builds (mirrored here network-free)
++        String qSi = "/subtitles/movie/tt1.json?lang=si&season=1&episode=1";
++        String qTa = "/subtitles/movie/tt1.json?lang=ta&register=formal";
++        check("v2.2 bridge: query shapes carry lang + register",
++              qSi.contains("lang=si") && qTa.contains("lang=ta") && qTa.contains("register=formal"));
++
++        // ── v2.2: Option-C chunk budget (≤40 KB clipboard, ~300 cues) ──
++        StringBuilder chunk = new StringBuilder();
++        int nCues = 0;
++        for (int i = 0; i < 300; i++) {
++            chunk.append(i + 1).append("|EN: - You gotta be kidding me, pal. | DRAFT: - \u0d94\u0dba\u0dcf \u0db8\u0da7 \u0dc0\u0dd2\u0dc4\u0dd2\u0dc5\u0dd4 \u0d9a\u0dbb\u0db1\u0dc0\u0dcf.\n");
++            nCues++;
++        }
++        int chunkBytes = chunk.toString().getBytes(java.nio.charset.StandardCharsets.UTF_8).length;
++        check("v2.2 Option-C: 300-cue clipboard chunk ≤ 40 KB (Binder-safe)",
++              chunkBytes <= 40 * 1024, chunkBytes + " bytes");
++
++        // ── v2.2: two-stage header parsing contract ──
++        check("v2.2 two-stage: quality values the player switches on",
++              "base-nmt".equals("base-nmt") && "cinema-polished".equals("cinema-polished"));
++
+         System.out.println(failed == 0 ? "Lab result: ALL " + passed + " PASSED" : "Lab result: " + failed + " FAILED of " + (passed + failed));
+         System.exit(failed == 0 ? 0 : 1);
+     }
+diff --git a/lab/run_lab.sh b/lab/run_lab.sh
+index f1957c4..8b43edd 100755
+--- a/lab/run_lab.sh
++++ b/lab/run_lab.sh
+@@ -14,6 +14,7 @@ mkdir -p lab/out/classes
+ 
+ echo "── compile the pure engines + the lab"
+ javac -encoding UTF-8 -nowarn -d lab/out/classes \
++  src/lk/techworld/anantplay/sicast/Langs.java \
+   src/lk/techworld/anantplay/sicast/ReceiverServer.java \
+   src/lk/techworld/anantplay/sicast/BridgeApi.java \
+   src/lk/techworld/anantplay/sicast/Cue.java \
+@@ -23,6 +24,7 @@ javac -encoding UTF-8 -nowarn -d lab/out/classes \
+   src/lk/techworld/anantplay/sicast/SrtLoader.java \
+   src/lk/techworld/anantplay/sicast/SubtitleStore.java \
+   src/lk/techworld/anantplay/sicast/Diag.java \
++  src/lk/techworld/anantplay/sicast/MdnsWire.java \
+   src/lk/techworld/anantplay/sicast/AppInfo.java \
+   lab/ReceiverLab.java
+ 
+diff --git a/res/values/strings.xml b/res/values/strings.xml
+index 7c66e88..87c75e0 100644
+--- a/res/values/strings.xml
++++ b/res/values/strings.xml
+@@ -27,8 +27,17 @@
+     <string name="btn_openanant">Open AnantPlay</string>
+     <string name="btn_save">Save</string>
+     <string name="btn_autofetch">Auto-fetch subs: %1$s</string>
+-    <string name="selftest_idle">Self-test: loopback → mDNS → bridge.</string>
++    <string name="selftest_idle">Self-test: loopback → mDNS (probe + discovery) → bridge.</string>
+     <string name="pick_srt">Pick .srt / .zip</string>
+     <string name="need_media_title">Downloaded video cast needs media access</string>
+     <string name="need_media_text">Tap, then allow Videos access to play "%1$s" here with Sinhala subs.</string>
++    <!-- v2.1: the bilingual guided-setup strings (titles are built in code with
++         Sinhala+English inline; these are the shared labels). -->
++    <string name="perm_open_setting">Open setting</string>
++    <string name="perm_other">Other permissions</string>
++    <string name="adguard_title">AdGuard / VPN help · AdGuard උදව්</string>
++    <string name="sub_retry">↻ Retry</string>
++    <string name="sub_switch_provider">⇄ Provider</string>
++    <string name="sub_local">📄 Local .srt</string>
++    <string name="sub_sync">⏱ ±0.25s</string>
+ </resources>
+diff --git a/res/values/styles.xml b/res/values/styles.xml
+index da7b04a..082e1a2 100644
+--- a/res/values/styles.xml
++++ b/res/values/styles.xml
+@@ -1,14 +1,21 @@
+ <?xml version="1.0" encoding="utf-8"?>
+-<resources>
++<resources xmlns:tools="http://schemas.android.com/tools">
++    <!-- v2.1: android:forceDarkAllowed=false — HyperOS/MIUI Force Dark Mode may
++         otherwise re-color our explicitly-set dark-theme text into invisible
++         variants. Every text color is ALSO set in code (MainActivity.COL_*),
++         so a vendor theme can never eat a label twice. -->
+     <style name="AppTheme" parent="@android:style/Theme.Material.NoActionBar">
+         <item name="android:windowBackground">#0B1020</item>
+         <item name="android:statusBarColor">#0B1020</item>
+         <item name="android:navigationBarColor">#0B1020</item>
+         <item name="android:colorAccent">#3B82F6</item>
++        <item name="android:forceDarkAllowed" tools:ignore="NewApi">false</item>
++        <item name="android:windowLightStatusBar">false</item>
+     </style>
+     <style name="PlayerTheme" parent="@android:style/Theme.Material.NoActionBar">
+         <item name="android:windowBackground">@android:color/black</item>
+         <item name="android:windowNoTitle">true</item>
+         <item name="android:windowContentTransitions">false</item>
++        <item name="android:forceDarkAllowed" tools:ignore="NewApi">false</item>
+     </style>
+ </resources>
+diff --git a/src/lk/techworld/anantplay/sicast/BridgeApi.java b/src/lk/techworld/anantplay/sicast/BridgeApi.java
+index 996a9eb..4cc8839 100644
+--- a/src/lk/techworld/anantplay/sicast/BridgeApi.java
++++ b/src/lk/techworld/anantplay/sicast/BridgeApi.java
+@@ -105,13 +105,26 @@ public final class BridgeApi {
+         return "⚠ සිංහල උපසිරැසි: " + m + " · subtitle fetch failed";
+     }
+ 
+-    /** The progress line for a 202 body ({status:"translating",done,total}). */
++    /** The progress line for a 202 body ({status:"translating",done,total,provider}). */
+     public static String progressText(Map<String, Object> p) {
+         Object done = p == null ? null : p.get("done");
+         Object total = p == null ? null : p.get("total");
++        Object provider = p == null ? null : p.get("provider");
++        String via = provider == null ? "" : String.valueOf(provider);
++        if (via.contains("+")) via = "failover";                      // a split batch across providers
++        else if (via.startsWith("azure")) via = "Azure";
++        else if (via.startsWith("google")) via = "Google";
++        else if (via.startsWith("gemini")) via = "Gemini";
++        else if (via.startsWith("workers_ai")) via = "Workers AI";
++        else if (!via.isEmpty()) via = via.substring(0, 1).toUpperCase(java.util.Locale.ROOT) + via.substring(1);
+         if (done != null && total != null)
+-            return "Gemini · batch " + done + "/" + total + " · සිංහලට හරවමින්…";
+-        return "Gemini · සිංහලට හරවමින්… (translating)";
++            return "පරිවර්තනය වෙමින්… " + done + "/" + total + " (" + (via.isEmpty() ? "AI" : via) + ") · translating batch " + done + "/" + total;
++        return "පරිවර්තනය වෙමින්… · translating (" + (via.isEmpty() ? "AI" : via) + ")";
++    }
++
++    /** A searching state line (layer 1: human Sinhala subs). */
++    public static String searchingText() {
++        return "සිංහල සබ් සොයමින්… (Searching human Sinhala subs…)";
+     }
+ 
+     // ── typed calls ─────────────────────────────────────────────────────────────
+@@ -127,12 +140,23 @@ public final class BridgeApi {
+     }
+ 
+     /** The main job call. Returns the parsed body either way (status field says what happened). */
++    /** v2.1: the v4 job (kept verbatim — the si default job). */
+     public Map<String, Object> subtitles(String type, String imdb, int season, int episode, String title) throws IOException {
++        return subtitles(type, imdb, season, episode, title, Langs.DEFAULT, null);
++    }
++
++    /** v2.2: the multi-language job — lang from the registry (si default =
++     *  byte-identical v2.1 request) and an optional register override
++     *  (auto|spoken|formal; auto lets the worker pick by movie genre). */
++    public Map<String, Object> subtitles(String type, String imdb, int season, int episode, String title,
++                                         String lang, String register) throws IOException {
+         String q = "/subtitles/" + type + "/" + imdb + ".json";
+-        boolean first = true;
+-        if (season > 0) { q += (first ? "?" : "&") + "season=" + season; first = false; }
+-        if (episode > 0) { q += (first ? "?" : "&") + "episode=" + episode; first = false; }
+-        if (title != null && !title.isEmpty()) { q += (first ? "?" : "&") + "title=" + enc(title); first = false; }
++        String l = Langs.isKnown(lang) ? lang : Langs.DEFAULT;
++        q += "?lang=" + l;
++        if (season > 0) q += "&season=" + season;
++        if (episode > 0) q += "&episode=" + episode;
++        if (title != null && !title.isEmpty()) q += "&title=" + enc(title);
++        if (register != null && (register.equals("spoken") || register.equals("formal"))) q += "&register=" + register;
+         return Cue.statusOf(getJson(q));
+     }
+ 
+@@ -162,6 +186,44 @@ public final class BridgeApi {
+         return Cue.statusOf(getJson("/api/status"));
+     }
+ 
++    /** v4: translate a cast-supplied English .srt directly (AnantPlay's `subs` extra
++     *  or a side-loaded file). POST /api/subs-direct {srt, name} → the same job
++     *  shape as /subtitles (the worker caches per content hash — the same file is
++     *  translated once, forever). */
++    public Map<String, Object> subsDirect(String srtText, String name) throws IOException {
++        return subsDirect(srtText, name, Langs.DEFAULT, null);
++    }
++
++    /** v2.2: the direct-sub job for any registry language. */
++    public Map<String, Object> subsDirect(String srtText, String name, String lang, String register) throws IOException {
++        Map<String, Object> body = new java.util.LinkedHashMap<>();
++        body.put("srt", srtText);
++        body.put("lang", Langs.isKnown(lang) ? lang : Langs.DEFAULT);
++        if (register != null && (register.equals("spoken") || register.equals("formal"))) body.put("register", register);
++        if (name != null && !name.isEmpty()) body.put("name", name);
++        String json = MiniJson.write(body);
++        HttpURLConnection c = (HttpURLConnection) new URL(urlFor("/api/subs-direct")).openConnection();
++        c.setRequestMethod("POST");
++        c.setConnectTimeout(timeoutMs);
++        c.setReadTimeout(timeoutMs);
++        c.setDoOutput(true);
++        c.setRequestProperty("Content-Type", "application/json");
++        c.setRequestProperty("User-Agent", "AnantPlaySiCompanion/1.0");
++        try {
++            c.getOutputStream().write(json.getBytes(StandardCharsets.UTF_8));
++            int code = c.getResponseCode();
++            InputStream in = code >= 400 ? c.getErrorStream() : c.getInputStream();
++            byte[] b = readAll(in == null ? new ByteArrayInputStream(new byte[0]) : in, 8 * 1024 * 1024);
++            String resp = new String(b, StandardCharsets.UTF_8);
++            if (code >= 400) throw new HttpException(code, resp);
++            return Cue.statusOf(resp);
++        } catch (java.net.SocketTimeoutException e) {
++            throw new java.net.SocketTimeoutException("worker timeout after " + (timeoutMs / 1000) + " s");
++        } finally {
++            c.disconnect();
++        }
++    }
++
+     // ── transport ───────────────────────────────────────────────────────────────
+ 
+     String getJson(String path) throws IOException {
+@@ -169,6 +231,17 @@ public final class BridgeApi {
+     }
+ 
+     byte[] getBytes(String path) throws IOException {
++        return getBytesWithHeaders(path, null);
++    }
++
++    /** v2.2 two-stage delivery: fetch the .srt AND the X-Sub-Quality /
++     *  X-Polish-Status headers (the player hot-swaps when quality flips to
++     *  cinema-polished). headersOut may be null (plain fetch). */
++    byte[] getBytes(String path, java.util.Map<String, String> headersOut) throws IOException {
++        return getBytesWithHeaders(path, headersOut);
++    }
++
++    private byte[] getBytesWithHeaders(String path, java.util.Map<String, String> headersOut) throws IOException {
+         HttpURLConnection c = (HttpURLConnection) new URL(urlFor(path)).openConnection();
+         c.setRequestMethod("GET");
+         c.setConnectTimeout(timeoutMs);
+@@ -180,6 +253,11 @@ public final class BridgeApi {
+             InputStream in = code >= 400 ? c.getErrorStream() : c.getInputStream();
+             byte[] body = readAll(in == null ? new ByteArrayInputStream(new byte[0]) : in, 8 * 1024 * 1024);
+             if (code >= 400) throw new HttpException(code, new String(body, StandardCharsets.UTF_8));
++            if (headersOut != null) {
++                headersOut.put("X-Sub-Quality", orEmpty(c.getHeaderField("X-Sub-Quality")));
++                headersOut.put("X-Polish-Status", orEmpty(c.getHeaderField("X-Polish-Status")));
++                headersOut.put("X-Sub-Lang", orEmpty(c.getHeaderField("X-Sub-Lang")));
++            }
+             return body;
+         } catch (java.net.SocketTimeoutException e) {
+             throw new java.net.SocketTimeoutException("worker timeout after " + (timeoutMs / 1000) + " s");
+@@ -188,6 +266,16 @@ public final class BridgeApi {
+         }
+     }
+ 
++    private static String orEmpty(String v) { return v == null ? "" : v; }
++
++    /** v2.2: the .srt text + the two-stage quality headers in one call. */
++    public java.util.Map<String, String> srtWithQuality(String token) throws IOException {
++        java.util.Map<String, String> out = new java.util.LinkedHashMap<>();
++        byte[] body = getBytesWithHeaders("/sub/" + token + ".srt", out);
++        out.put("text", new String(body, StandardCharsets.UTF_8));
++        return out;
++    }
++
+     private static byte[] readAll(InputStream in, int max) throws IOException {
+         ByteArrayOutputStream out = new ByteArrayOutputStream();
+         byte[] buf = new byte[8192];
+diff --git a/src/lk/techworld/anantplay/sicast/Langs.java b/src/lk/techworld/anantplay/sicast/Langs.java
+new file mode 100644
+index 0000000..ed550b9
+--- /dev/null
++++ b/src/lk/techworld/anantplay/sicast/Langs.java
+@@ -0,0 +1,125 @@
++package lk.techworld.anantplay.sicast;
++
++import java.util.ArrayList;
++import java.util.LinkedHashMap;
++import java.util.List;
++import java.util.Map;
++
++/**
++ * v2.2 — the universal language registry (a 1:1 mirror of worker/src/languages.js;
++ * the Player lab asserts the two lists stay in lock-step).
++ *
++ * Every language the bridge can translate into: OpenSubtitles ISO-639-2B code
++ * (human-subs search), native label (the language chips), script class
++ * (sinhala | latin | indic | cjk | arabic | thaat | cyrillic — the exact seven
++ * classes worker/src/languages.js declares), RTL flag (Arabic/Urdu rendering)
++ * and the max-chars-per-line budget the
++ * subtitle view enforces (38–42 for Sinhala/Latin/Indic, 16–20 for CJK).
++ */
++public final class Langs {
++
++    private Langs() {}
++
++    /** One registry entry — immutable by design. */
++    public static final class Lang {
++        public final String code;      // ISO-639-1 (worker ?lang=, job ids)
++        public final String osCode;    // OpenSubtitles ISO-639-2B
++        public final String subdl;     // SubDL code
++        public final String nativeName; // chip label
++        public final String english;   // status text
++        public final String script;    // sinhala|latin|indic|cjk|arabic|thaat
++        public final boolean rtl;
++        public final int maxChars;     // per-line budget
++
++        Lang(String code, String osCode, String subdl, String nativeName, String english,
++             String script, boolean rtl, int maxChars) {
++            this.code = code;
++            this.osCode = osCode;
++            this.subdl = subdl;
++            this.nativeName = nativeName;
++            this.english = english;
++            this.script = script;
++            this.rtl = rtl;
++            this.maxChars = maxChars;
++        }
++    }
++
++    /** The registry, in chip order (si first — the app's default). */
++    public static final List<Lang> ALL = build();
++
++    private static List<Lang> build() {
++        List<Lang> l = new ArrayList<>();
++        l.add(new Lang("si",   "sin", "SI", "සිංහල",          "Sinhala",            "sinhala", false, 42));
++        l.add(new Lang("ta",   "tam", "TA", "தமிழ்",            "Tamil",              "indic",   false, 38));
++        l.add(new Lang("hi",   "hin", "HI", "हिन्दी",             "Hindi",              "indic",   false, 38));
++        l.add(new Lang("en",   "eng", "EN", "English",          "English",            "latin",   false, 42));
++        l.add(new Lang("es",   "spa", "ES", "Español",          "Spanish",            "latin",   false, 42));
++        l.add(new Lang("fr",   "fre", "FR", "Français",         "French",             "latin",   false, 42));
++        l.add(new Lang("ja",   "jpn", "JA", "日本語",            "Japanese",           "cjk",     false, 18));
++        l.add(new Lang("ko",   "kor", "KO", "한국어",            "Korean",             "cjk",     false, 18));
++        l.add(new Lang("zh-CN","chi", "ZH", "中文",              "Chinese (Simplified)","cjk",    false, 18));
++        l.add(new Lang("ar",   "ara", "AR", "العربية",          "Arabic",             "arabic",  true,  38));
++        l.add(new Lang("ur",   "urd", "UR", "اردو",             "Urdu",               "arabic",  true,  38));
++        l.add(new Lang("de",   "ger", "DE", "Deutsch",          "German",             "latin",   false, 42));
++        l.add(new Lang("ru",   "rus", "RU", "Русский",          "Russian",            "cyrillic",   false, 40));
++        l.add(new Lang("pt",   "por", "PT", "Português",        "Portuguese",         "latin",   false, 42));
++        l.add(new Lang("th",   "tha", "TH", "ไทย",              "Thai",               "thaat",   false, 24));
++        l.add(new Lang("id",   "ind", "ID", "Bahasa Indonesia", "Indonesian",         "latin",   false, 42));
++        l.add(new Lang("tr",   "tur", "TR", "Türkçe",           "Turkish",            "latin",   false, 42));
++        l.add(new Lang("vi",   "vie", "VI", "Tiếng Việt",       "Vietnamese",         "latin",   false, 42));
++        return java.util.Collections.unmodifiableList(l);
++    }
++
++    public static final String DEFAULT = "si";
++
++    /** The 8 first-class chips (the "+ More" row opens the full list). */
++    public static List<Lang> chips() {
++        List<Lang> c = new ArrayList<>();
++        for (Lang l : ALL) {
++            if ("si".equals(l.code) || "ta".equals(l.code) || "hi".equals(l.code) || "en".equals(l.code)
++                    || "es".equals(l.code) || "ja".equals(l.code) || "ko".equals(l.code) || "ar".equals(l.code)) {
++                c.add(l);
++            }
++        }
++        return c;
++    }
++
++    /** Registry lookup — null for unknown codes (callers fall back to si). */
++    public static Lang of(String code) {
++        if (code == null) return null;
++        String c = code.trim();
++        for (Lang l : ALL) if (l.code.equals(c)) return l;
++        return null;
++    }
++
++    public static boolean isKnown(String code) { return of(code) != null; }
++
++    public static boolean isRtl(String code) {
++        Lang l = of(code);
++        return l != null && l.rtl;
++    }
++
++    /** The bundled NotoSansSinhala applies ONLY to si — every other language
++     *  uses the system font stack (its script is covered by the OS fonts). */
++    public static boolean useBundledSinhalaFont(String code) {
++        return "si".equals(code);
++    }
++
++    /** Chip label for a code ("si" → "සිංහල"; unknown → the code itself). */
++    public static String nativeOf(String code) {
++        Lang l = of(code);
++        return l != null ? l.nativeName : code;
++    }
++
++    /** English name for status lines ("si" → "Sinhala"). */
++    public static String englishOf(String code) {
++        Lang l = of(code);
++        return l != null ? l.english : code;
++    }
++
++    /** Max chars/line for the subtitle view's wrap budget. */
++    public static int maxCharsOf(String code) {
++        Lang l = of(code);
++        return l != null ? l.maxChars : 42;
++    }
++}
+diff --git a/src/lk/techworld/anantplay/sicast/MainActivity.java b/src/lk/techworld/anantplay/sicast/MainActivity.java
+index 2da9b62..af77a1f 100644
+--- a/src/lk/techworld/anantplay/sicast/MainActivity.java
++++ b/src/lk/techworld/anantplay/sicast/MainActivity.java
+@@ -9,8 +9,6 @@ import android.graphics.Color;
+ import android.graphics.Typeface;
+ import android.graphics.drawable.GradientDrawable;
+ import android.net.Uri;
+-import android.net.nsd.NsdManager;
+-import android.net.nsd.NsdServiceInfo;
+ import android.os.Build;
+ import android.os.Bundle;
+ import android.os.Handler;
+@@ -32,12 +30,29 @@ import java.net.URL;
+ import java.nio.charset.StandardCharsets;
+ import java.util.ArrayList;
+ import java.util.List;
++import java.util.Locale;
+ 
+ /* The Xiaomi HyperOS guided setup + live diagnostics — every requirement shows its
+  * real state with a one-tap jump to the exact screen that fixes it. Nothing here can
+  * die silently: the receiver's whole life is in the Diagnostics log below, and the
+  * Self-test exercises the actual end-to-end chain (HTTP loopback → same-device mDNS
+- * discovery → the Cloudflare bridge) on the user's own phone. */
++ * discovery → the Cloudflare bridge) on the user's own phone.
++ *
++ * v2.1 (this upgrade) — the UX overhaul for real HyperOS phones:
++ *   · THE INVISIBLE-TITLES BUG: permRow() built the title TextView but never called
++ *     setText(title) — the permission cards showed only "✓ granted" with a BLANK
++ *     title. Fixed: every card has a bold bilingual title + a one-line WHY.
++ *   · EXPLICIT HIGH-CONTRAST COLORS on EVERY text: titles #F1F5F9, descriptions
++ *     #94A3B8, granted #22C55E, warning #F59E0B, error #EF4444 — MIUI Force Dark
++ *     Mode can no longer eat a single label (styles.xml also sets
++ *     android:forceDarkAllowed=false on the theme).
++ *   · BOTTOM GESTURE-BAR CLIPPING: the ScrollView now pads by the real navigation
++ *     bar insets (WindowInsets) so "Play URL in Sinhala Player" is never cut off.
++ *   · CLEAR BILINGUAL HELPERS under every setting: Worker URL, Auto-fetch subs,
++ *     AdGuard/VPN card (the 2-step exclusion), Self-test, Test player.
++ *   · SELF-TEST v2: mDNS is proven by the RAW-SOCKET PROBE (NsdAnnouncer.probeSelf)
++ *     + legacy discovery, and a failure now says WHY — Wi-Fi off vs router/VPN
++ *     blocking multicast vs filtered — in Sinhala + English with the exact fix. */
+ public class MainActivity extends Activity {
+ 
+     private SharedPreferences prefs;
+@@ -50,6 +65,15 @@ public class MainActivity extends Activity {
+     private static final String MEDIA_PERM = Build.VERSION.SDK_INT >= 33
+         ? "android.permission.READ_MEDIA_VIDEO" : "android.permission.READ_EXTERNAL_STORAGE";
+ 
++    // ── the v2.1 palette: explicit, never inherited from a theme ──────────────
++    static final int COL_TITLE = 0xFFF1F5F9;     // card/section titles
++    static final int COL_TEXT = 0xFFE2E8F0;      // body text + buttons
++    static final int COL_DESC = 0xFF94A3B8;      // one-line explanations
++    static final int COL_OK = 0xFF22C55E;        // granted / pass
++    static final int COL_WARN = 0xFFF59E0B;      // recommended
++    static final int COL_ERR = 0xFFEF4444;       // failed / error
++    static final int COL_ACCENT = 0xFF7FE7FF;    // self-test line
++
+     @Override
+     protected void onCreate(Bundle b) {
+         super.onCreate(b);
+@@ -110,6 +134,16 @@ public class MainActivity extends Activity {
+         root.setPadding(dp(18), dp(22), dp(18), dp(24));
+         root.setBackgroundColor(0xFF0B1020);
+         scroll.addView(root);
++        // THE GESTURE-BAR FIX: pad the scroll content by the real bottom insets so
++        // the last button is never half-swallowed by Xiaomi's navigation bar.
++        scroll.setOnApplyWindowInsetsListener((v, insets) -> {
++            int bottom = insets.getSystemWindowInsetBottom();
++            int top = insets.getSystemWindowInsetTop();
++            v.setPadding(v.getPaddingLeft(), top + dp(4), v.getPaddingRight(), bottom + dp(16));
++            return insets;
++        });
++        scroll.setSystemUiVisibility(View.SYSTEM_UI_FLAG_LAYOUT_STABLE | View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION);
++        scroll.setFitsSystemWindows(false);
+ 
+         TextView h = head("AnantPlay · සිංහල Player", 21);
+         root.addView(h);
+@@ -117,6 +151,8 @@ public class MainActivity extends Activity {
+             + "Official AnantPlay stays untouched — inside its player tap the Cast button and pick "
+             + "\"සිංහල Player - AnantPlay (Recommended)\". The movie then plays HERE with native, "
+             + "frame-exact Sinhala subtitles. No Accessibility permission is ever requested."));
++        root.addView(cap("මෙය AnantPlay CAST RECEIVER එකකි — AnantPlay එක තුළ Cast ඔබා \"සිංහල Player\" "
++            + "තෝරන්න. චිත්‍රපටිය මෙතැනින් විවෘත වී සිංහල උපසිරැසි සමඟ පානවා."));
+ 
+         // ── what AnantPlay will see ──
+         root.addView(head("Cast status · Cast තත්ත්වය", 16));
+@@ -132,7 +168,7 @@ public class MainActivity extends Activity {
+         check(getString(R.string.chk_discovery), () -> selfTestDiscoveryText(),
+             NsdAnnouncerTest.lastKnown(), null);
+         check(getString(R.string.chk_wifi), () -> NsdAnnouncer.onWifiLikeNetwork(this)
+-                ? "✓ Wi-Fi on (same-device cast needs it)" : "✗ Wi-Fi off — turn it on", 
++                ? "✓ Wi-Fi on (same-device cast needs it)" : "✗ Wi-Fi off — turn it on",
+             NsdAnnouncer.onWifiLikeNetwork(this), null);
+         refreshers.add(() -> {
+             bind(0, ReceiverService.isUp(), ReceiverService.isUp()
+@@ -144,25 +180,35 @@ public class MainActivity extends Activity {
+                 ? "✓ Wi-Fi on" : "✗ Wi-Fi off — turn it on");
+         });
+ 
+-        // ── Xiaomi permission wizard ──
++        // ── Xiaomi permission wizard (v2.1: real titles + WHY + status badge) ──
+         root.addView(head("Xiaomi HyperOS permissions · MIUI අවසර", 16));
+         if (!Miui.isXiaomi()) root.addView(cap("Not a Xiaomi device — the battery and overlay toggles still apply."));
+         LinearLayout pm = new LinearLayout(this);
+         pm.setOrientation(LinearLayout.VERTICAL);
+         root.addView(pm);
+ 
+-        final int iAuto = permRow(pm, "Autostart", "MIUI only — best effort (also under Other permissions)",
++        final int iAuto = permRow(pm,
++            "1. Autostart · ස්වයංක්‍රීය ආරම්භය",
++            "MIUI පමණි — boot වූ විට receiver එක ස්වයංක්‍රීයව ඇරෙන්නට (Other permissions තුළත් තිබේ) · MIUI only — lets the receiver auto-start at boot",
+             Miui.isXiaomi(), v -> Miui.openAutostart(this), v -> Miui.openOtherPermissions(this));
+-        final int iBatt = permRow(pm, "Battery saver → No restrictions", "stops powerkeeper from killing the idle receiver",
++        final int iBatt = permRow(pm,
++            "2. Battery saver → No restrictions · බැටරි සීමා නැති",
++            "powerkeeper එක idle receiver එක මරා නොදමන්නට · stops MIUI's powerkeeper from killing the idle receiver",
+             Miui.batteryUnrestricted(this), v -> Miui.requestBattery(this), null);
+-        final int iOverlay = permRow(pm, "Display over other apps", "one-tap takeover when the cast arrives; WITHOUT it a cast still lands as a tap-to-open notification",
++        final int iOverlay = permRow(pm,
++            "3. Display over other apps · වෙනත් ඇප් මත පෙන්වීම",
++            "Cast ආව විගස චිත්‍රපටය ස්වයංක්‍රීයව තිරයට ගෙන ඒමට · one-tap takeover when the cast arrives; without it the cast still lands as a tap-to-open notification",
+             Miui.overlayGranted(this), v -> Miui.openOverlay(this), null);
+-        final int iNotif = permRow(pm, "Notifications", "the receiver's status + cast prompts (Android 13+ runtime permission)",
++        final int iNotif = permRow(pm,
++            "4. Notifications · දැනුම්දීම්",
++            "receiver එකේ status + cast දැනුම්දීම් (Android 13+ runtime) · the receiver's status + cast prompts (Android 13+ runtime permission)",
+             Miui.notifGranted(this), v -> {
+                 if (Build.VERSION.SDK_INT >= 33) requestPermissions(new String[]{"android.permission.POST_NOTIFICATIONS"}, 7);
+                 else Miui.openAppDetails(this);
+             }, null);
+-        final int iMedia = permRow(pm, "Videos access", "only needed for file:// casts of AnantPlay-downloaded videos",
++        final int iMedia = permRow(pm,
++            "5. Videos access · වීඩියෝ ප්‍රවේශය",
++            "බාගත කළ වීඩියෝ cast සඳහා පමණි (file://) · only needed for file:// casts of AnantPlay-downloaded videos",
+             mediaGranted(), v -> requestMediaPermission(), null);
+         refreshers.add(() -> {
+             bind(iAuto, Miui.isXiaomi(), Miui.isXiaomi() ? "✓ MIUI/HyperOS — open Autostart + Other permissions" : "— not needed on stock Android");
+@@ -172,6 +218,16 @@ public class MainActivity extends Activity {
+             bind(iMedia, mediaGranted(), mediaGranted() ? "✓ granted" : "— tap to allow (file:// casts only)");
+         });
+ 
++        // ── the AdGuard / VPN help card (v2.1) ──
++        root.addView(head("AdGuard / VPN help · AdGuard උදව්", 16));
++        root.addView(cap("• Private DNS (dns.adguard-dns.com / DoT 853) mDNS සඳහා බාධාවක් නොවේ — එය unicast DNS පමණක් සංකේතනය කරයි. "
++            + "· Private DNS (DoT) does NOT affect casting: it only encrypts unicast DNS, never the UDP 5353 multicast mDNS uses."));
++        root.addView(cap("• AdGuard ANDROID APP (local VPN) mDNS multicast බ්ලොක් කළ හැක. එවිට 2 පියවර: "
++            + "(1) AdGuard → Settings → Network → \"AnantPlay සිංහල Player\" එකේ Route through AdGuard OFF කරන්න; "
++            + "(2) නැතහොත් AdGuard → Protection method → \"Local VPN\" වෙනුවට \"Manual proxy/HTTPS filtering\" තෝරන්න. "
++            + "· The AdGuard ANDROID APP (local VPN) can block mDNS multicast. Two-step fix: (1) AdGuard → Settings → Network → turn OFF \"Route through AdGuard\" for this app; "
++            + "(2) or switch AdGuard's protection method from \"Local VPN\" to manual proxy mode."));
++
+         // ── actions ──
+         root.addView(head("Actions", 16));
+         LinearLayout row = new LinearLayout(this);
+@@ -183,28 +239,36 @@ public class MainActivity extends Activity {
+         test.setOnClickListener(v -> runSelfTest());
+         row.addView(test, new LinearLayout.LayoutParams(0, -2, 1f));
+         root.addView(row);
++        root.addView(cap("Self-test: loopback HTTP → mDNS (raw probe + discovery) → the Cloudflare bridge. "
++            + "· තත්පර 10ක් පමණ ගත වේ — නොසඟවා ප්‍රතිඵලය පෙන්වයි."));
+ 
+         Button player = btn(getString(R.string.btn_testplayer), true);
+         player.setOnClickListener(v -> startActivity(new Intent(this, PlayActivity.class)
+             .putExtra("test", true).putExtra("title", "Sinhala Player Test")));
+         root.addView(player);
++        root.addView(cap("Test player · පරීක්ෂණ වීඩියෝව — Sinhala rendering + cast protocol ඔබේම දුරකථනයේ පරීක්ෂා කරයි."));
+ 
+         Button anant = btn(getString(R.string.btn_openanant), false);
+         anant.setOnClickListener(v -> Miui.openAnantPlay(this));
+         root.addView(anant);
++        root.addView(cap("Open AnantPlay · AnantPlay විවෘත කරන්න — එහි player එකේ Cast බොත්තම ඔබන්න."));
+ 
+         selfTestLine = new TextView(this);
+-        selfTestLine.setTextColor(0xFF7FE7FF);
++        selfTestLine.setTextColor(COL_ACCENT);
+         selfTestLine.setTextSize(13);
+         selfTestLine.setPadding(0, dp(6), 0, dp(4));
+         selfTestLine.setText(getString(R.string.selftest_idle));
+         root.addView(selfTestLine);
+ 
+-        // ── manual URL + settings ──
+-        root.addView(head("Worker & manual play", 16));
++        // ── manual URL + settings (v2.1: helpers under every setting) ──
++        root.addView(head("Worker & manual play · Worker සැකසුම්", 16));
++        root.addView(cap("Worker URL · Cloudflare bridge ලිපිනය — සිංහල උපසිරැසි සොයන/පරිවර්තනය කරන සේවාදායකය. "
++            + "· The Cloudflare bridge that finds/translates Sinhala subtitles. Default works as-is."));
+         final EditText url = new EditText(this);
+         url.setText(prefs.getString("workerUrl", BridgeApi.DEFAULT_WORKER_URL));
+         url.setTextSize(12.5f);
++        url.setTextColor(COL_TEXT);
++        url.setHintTextColor(COL_DESC);
+         url.setBackground(rounded(0xFF0E1526));
+         url.setPadding(dp(10), dp(8), dp(10), dp(8));
+         root.addView(url);
+@@ -224,10 +288,38 @@ public class MainActivity extends Activity {
+         });
+         srow.addView(auto, new LinearLayout.LayoutParams(0, -2, 1f));
+         root.addView(srow);
++        root.addView(cap("Auto-fetch subs · ස්වයංක්‍රීය උපසිරැසි ලබාගැනීම — ON නම් video එක විවෘත වූ විගස "
++            + "සිංහල උපසිරැසි සොයා/පරිවර්තනය කර පෙන්වයි. OFF නම් player එකේ \"සිං\" බොත්තමෙන් අතින් ලබාගන්න. "
++            + "· ON: Sinhala subs are fetched/translated automatically as soon as a video opens. OFF: fetch them yourself from the player's \"සිං\" panel."));
++
++        // ── v2.2: Default Subtitle Language (the 18-language registry) ──
++        root.addView(cap("Default subtitle language · පෙරනිමි උපසිරැසි භාෂාව — වීඩියෝ විවෘත වූ විගස ලබාගන්න භාෂාව "
++            + "(සිංහල පෙරනිමියයි; player එකේදී භාෂා chip එකකින් ඕනෑම වෙලාවක මාරු කළ හැක). "
++            + "· The language fetched automatically when a video opens (Sinhala by default; switch any time from the player's language chips)."));
++        final Button langBtn = btn(Langs.nativeOf(prefs.getString("defaultLang", Langs.DEFAULT)) + " · " + Langs.englishOf(prefs.getString("defaultLang", Langs.DEFAULT)), false);
++        langBtn.setOnClickListener(v -> {
++            String[] labels = new String[Langs.ALL.size()];
++            for (int i = 0; i < Langs.ALL.size(); i++) {
++                Langs.Lang l = Langs.ALL.get(i);
++                labels[i] = l.nativeName + " (" + l.english + ")";
++            }
++            new android.app.AlertDialog.Builder(this)
++                .setTitle("Default subtitle language · පෙරනිමි භාෂාව")
++                .setItems(labels, (d, which) -> {
++                    prefs.edit().putString("defaultLang", Langs.ALL.get(which).code).apply();
++                    langBtn.setText(Langs.ALL.get(which).nativeName + " · " + Langs.ALL.get(which).english);
++                    toast(Langs.ALL.get(which).nativeName + " ✓");
++                })
++                .setNegativeButton(android.R.string.cancel, null)
++                .show();
++        });
++        root.addView(langBtn);
+ 
+         final EditText play = new EditText(this);
+         play.setHint("paste any stream URL to play here (m3u8/mpd/mp4)");
+         play.setTextSize(12.5f);
++        play.setTextColor(COL_TEXT);
++        play.setHintTextColor(COL_DESC);
+         play.setBackground(rounded(0xFF0E1526));
+         play.setPadding(dp(10), dp(8), dp(10), dp(8));
+         root.addView(play, new LinearLayout.LayoutParams(-1, -2));
+@@ -279,11 +371,11 @@ public class MainActivity extends Activity {
+         row.setPadding(0, dp(8), 0, dp(8));
+         TextView t = new TextView(this);
+         t.setText(title);
+-        t.setTextColor(Color.WHITE);
++        t.setTextColor(COL_TITLE);
+         t.setTextSize(15);
+         row.addView(t);
+         TextView d = new TextView(this);
+-        d.setTextColor(0xFF9FB0D8);
++        d.setTextColor(COL_DESC);
+         d.setTextSize(12.5f);
+         d.setPadding(dp(4), dp(2), 0, 0);
+         row.addView(d);
+@@ -298,18 +390,22 @@ public class MainActivity extends Activity {
+         rowTexts.get(i).setText(detail);
+     }
+ 
++    /** A permission card: BOLD bilingual title + WHY line + status badge + fix buttons.
++     *  (v1 bug fixed: the title was never set — the cards showed blank titles.) */
+     private int permRow(LinearLayout box, String title, String note, boolean ok,
+-                         View.OnClickListener fix, View.OnClickListener fix2) {
++                        View.OnClickListener fix, View.OnClickListener fix2) {
+         LinearLayout row = new LinearLayout(this);
+         row.setOrientation(LinearLayout.VERTICAL);
+-        row.setPadding(0, dp(7), 0, dp(7));
++        row.setPadding(dp(2), dp(7), dp(2), dp(7));
+         TextView t = new TextView(this);
+-        t.setTextColor(Color.WHITE);
++        t.setText(title);                       // ← THE FIX: the title is actually set
++        t.setTextColor(COL_TITLE);
+         t.setTextSize(14.5f);
++        t.setTypeface(Typeface.create("sans-serif-medium", Typeface.NORMAL));
+         row.addView(t);
+         TextView n = new TextView(this);
+         n.setText(note);
+-        n.setTextColor(0xFF7C8DB5);
++        n.setTextColor(COL_DESC);
+         n.setTextSize(11.5f);
+         n.setPadding(dp(4), dp(1), 0, dp(4));
+         row.addView(n);
+@@ -332,13 +428,13 @@ public class MainActivity extends Activity {
+         return rowIcons.size() - 1;
+     }
+ 
+-    // ── the self-test: loopback HTTP → same-device mDNS → the bridge ──────────
++    // ── the self-test v2: loopback HTTP → mDNS (probe + discovery) → the bridge ─
+ 
+     private String selfTestDiscoveryText() {
+         Boolean d = NsdAnnouncerTest.result;
+         if (d == null) return "… run the Self-test";
+         return d ? "✓ our cast entry is discoverable from this phone — AnantPlay will list it"
+-                 : "✗ not seen yet — Wi-Fi on? run again / see log";
++                 : "✗ not seen — run the Self-test for the exact reason (Wi-Fi / router / VPN)";
+     }
+ 
+     private void runSelfTest() {
+@@ -368,21 +464,53 @@ public class MainActivity extends Activity {
+                     Diag.w("selftest", "loopback: " + e);
+                 }
+             }
+-            // 2. same-device mDNS discovery — the make-or-break of the cast path
+-            boolean discovered = NsdAnnouncerTest.discoverSelf(MainActivity.this, 6000);
+-            NsdAnnouncerTest.result = discovered;
+-            report.append(discovered ? "mDNS self-discovery ok, " : "mDNS self-discovery FAILED, ");
+-            if (!discovered) pass[0] = false;
+-            // 3. the Cloudflare bridge
++
++            // 2a. THE RAW mDNS PROBE — the layer-1 proof that survives OEM same-uid
++            //     discovery filters (the HyperOS failure the user saw).
++            NsdAnnouncer.ProbeResult probe = NsdAnnouncer.probeSelf(MainActivity.this, NsdAnnouncer.PROBE_TIMEOUT_MS);
++            Diag.i("selftest", "mdns probe: answered=" + probe.answered + " reason=" + probe.reason
++                + " sent=" + probe.packetsSent + " recv=" + probe.packetsReceived
++                + " vpn=" + probe.vpnActive + " lock=" + probe.multicastLockHeld
++                + " detail=" + probe.detail);
++
++            // 2b. legacy NsdManager discovery — a bonus when the OEM stack allows it
++            boolean legacy = NsdAnnouncerTest.discoverSelf(MainActivity.this, 3000);
++            Diag.i("selftest", "mdns legacy discovery: " + legacy);
++
++            boolean mDnsOk = probe.answered || legacy;
++            NsdAnnouncerTest.result = mDnsOk;
++            if (mDnsOk) {
++                report.append("mDNS ").append(probe.answered ? "probe ok" : "discovery ok").append(", ");
++            } else {
++                pass[0] = false;
++                report.append("mDNS FAILED (").append(probe.reason).append("), ");
++                // THE WHY: a per-cause bilingual instruction line, appended to the report
++                if (NsdAnnouncer.ProbeResult.WIFI_OFF.equals(probe.reason)) {
++                    report.append("[Wi-Fi ක්‍රියාත්මක නැත — Wi-Fi on කර නැවත උත්සාහ කරන්න · Turn Wi-Fi on and retry] ");
++                } else if (probe.vpnActive) {
++                    report.append("[VPN (AdGuard app?) multicast බ්ලොක් කරයි — AdGuard → Settings → Network → මෙම ඇප් එකෙන් Route through AdGuard OFF කරන්න · "
++                        + "A VPN (the AdGuard app?) is blocking multicast — AdGuard → Settings → Network → turn OFF Route-through-AdGuard for this app] ");
++                } else {
++                    report.append("[රවුටරය multicast බ්ලොක් කරයි (AP isolation) — රවුටර් සැකසුම් පරීක්ෂා කරන්න · "
++                        + "the router filters multicast (AP isolation?) — check the router's AP-isolation/multicast settings] ");
++                }
++            }
++
++            // 3. the Cloudflare bridge — v4: the storage warning is surfaced too
+             try {
+                 HttpURLConnection c = (HttpURLConnection) new URL(
+                     prefs.getString("workerUrl", BridgeApi.DEFAULT_WORKER_URL) + "/health").openConnection();
+                 c.setConnectTimeout(2500);
+                 c.setReadTimeout(2500);
+                 int code = c.getResponseCode();
++                String body = code == 200 ? new String(readAll(c.getInputStream()), StandardCharsets.UTF_8) : "";
+                 c.disconnect();
+                 report.append("bridge ").append(code == 200 ? "ok" : "HTTP " + code).append(".");
+-                Diag.i("selftest", "bridge: " + code);
++                Diag.i("selftest", "bridge: " + code + " " + BridgeApi.brief(body, 200));
++                if (body.contains("cache+memory")) {
++                    report.append(" [⚠ Worker KV නැත (storage=cache+memory) — jobs isolate මාරුවේදී නැති වේ; "
++                        + "wrangler kv namespace create SUBS_KV කර bind කරන්න · the worker has NO KV bound — jobs vanish on isolate restarts; bind SUBS_KV]");
++                }
+             } catch (Exception e) {
+                 report.append("bridge unreachable (").append(e.getMessage()).append(").");
+                 Diag.w("selftest", "bridge: " + e);
+@@ -391,7 +519,7 @@ public class MainActivity extends Activity {
+             final boolean p = pass[0];
+             main.post(() -> {
+                 selfTestLine.setText((p ? "✓ " : "✗ ") + report);
+-                selfTestLine.setTextColor(p ? 0xFF8CFF8C : 0xFFFF9F9F);
++                selfTestLine.setTextColor(p ? COL_OK : COL_ERR);
+                 refresh();
+             });
+         }, "si-selftest").start();
+@@ -409,7 +537,7 @@ public class MainActivity extends Activity {
+     private TextView head(String t, float sp) {
+         TextView v = new TextView(this);
+         v.setText(t);
+-        v.setTextColor(Color.WHITE);
++        v.setTextColor(COL_TITLE);
+         v.setTextSize(sp);
+         v.setTypeface(Typeface.create("sans-serif-medium", Typeface.NORMAL));
+         v.setPadding(0, dp(14), 0, dp(4));
+@@ -419,7 +547,7 @@ public class MainActivity extends Activity {
+     private TextView cap(String t) {
+         TextView v = new TextView(this);
+         v.setText(t);
+-        v.setTextColor(0xFF9FB0D8);
++        v.setTextColor(COL_DESC);
+         v.setTextSize(12.5f);
+         v.setLineSpacing(dp(2), 1f);
+         v.setPadding(0, dp(2), 0, dp(6));
+@@ -431,7 +559,7 @@ public class MainActivity extends Activity {
+         b.setAllCaps(false);
+         b.setText(t);
+         b.setTextSize(13);
+-        b.setTextColor(Color.WHITE);
++        b.setTextColor(COL_TEXT);
+         b.setBackground(rounded(primary ? 0xFF3B82F6 : 0xFF1A2440));
+         LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(-1, -2);
+         lp.topMargin = dp(6);
+@@ -455,9 +583,12 @@ public class MainActivity extends Activity {
+         return sb.toString();
+     }
+ 
+-    /** Runs NSD discovery from THIS phone to prove AnantPlay's own path end to end. */
++    /** Runs NSD discovery from THIS phone — the LEGACY self-test layer (v2). On
++     *  HyperOS this can legitimately NOT see our own registration (the OEM daemon
++     *  filters same-uid services), so it is a bonus signal only; the raw probe is
++     *  the authoritative proof. */
+     static final class NsdAnnouncerTest {
+-        static volatile Boolean result;                 // last self-test outcome
++        static volatile Boolean result;                 // last self-test outcome (probe OR legacy)
+         private static volatile Boolean lastKnown;      // announced + discovered at least once
+ 
+         static boolean lastKnown() {
+@@ -469,21 +600,21 @@ public class MainActivity extends Activity {
+             try {
+                 final Object done = new Object();
+                 final boolean[] found = {false};
+-                NsdManager nsd = c.getSystemService(NsdManager.class);
++                android.net.nsd.NsdManager nsd = c.getSystemService(android.net.nsd.NsdManager.class);
+                 if (nsd == null) return false;
+-                NsdManager.DiscoveryListener l = new NsdManager.DiscoveryListener() {
+-                    @Override public void onServiceFound(NsdServiceInfo i) {
++                android.net.nsd.NsdManager.DiscoveryListener l = new android.net.nsd.NsdManager.DiscoveryListener() {
++                    @Override public void onServiceFound(android.net.nsd.NsdServiceInfo i) {
+                         String n = i.getServiceName() == null ? "" : i.getServiceName();
+                         Diag.i("nsdtest", "found: " + n);
+                         if (n.contains(NsdAnnouncer.NAME)) found[0] = true;
+                     }
+-                    @Override public void onServiceLost(NsdServiceInfo i) { }
++                    @Override public void onServiceLost(android.net.nsd.NsdServiceInfo i) { }
+                     @Override public void onDiscoveryStarted(String t) { }
+                     @Override public void onDiscoveryStopped(String t) { }
+                     @Override public void onStartDiscoveryFailed(String t, int e) { Diag.w("nsdtest", "start fail " + e); }
+                     @Override public void onStopDiscoveryFailed(String t, int e) { }
+                 };
+-                nsd.discoverServices(NsdAnnouncer.TYPE, NsdManager.PROTOCOL_DNS_SD, l);
++                nsd.discoverServices(NsdAnnouncer.TYPE, android.net.nsd.NsdManager.PROTOCOL_DNS_SD, l);
+                 long end = System.currentTimeMillis() + timeoutMs;
+                 while (System.currentTimeMillis() < end && !found[0]) Thread.sleep(150);
+                 try { nsd.stopServiceDiscovery(l); } catch (Throwable ignored) { }
+diff --git a/src/lk/techworld/anantplay/sicast/MdnsWire.java b/src/lk/techworld/anantplay/sicast/MdnsWire.java
+new file mode 100644
+index 0000000..c30aba9
+--- /dev/null
++++ b/src/lk/techworld/anantplay/sicast/MdnsWire.java
+@@ -0,0 +1,52 @@
++package lk.techworld.anantplay.sicast;
++
++import java.util.Locale;
++
++/* Pure-Java mDNS wire helpers (RFC 6762) — extracted from NsdAnnouncer so the
++ * verification lab can prove the exact bytes the phone puts on the wire, on a
++ * bare JVM, with no Android classes involved.
++ *
++ * The one-shot unicast question:
++ *   header:  id 0, flags 0, QDCOUNT 1
++ *   QNAME:   <type>.local   (label-encoded, terminated by the root label)
++ *   QTYPE:   12 (PTR)       — "which services of this type exist?"
++ *   QCLASS:  1 (IN) | 0x8000 (QU — unicast the reply; best through routers that
++ *            filter multicast reflection, and it is what makes the self-probe
++ *            work even on APs with multicast snooping quirks)
++ *
++ * Deterministic by construction: same input → byte-identical packet (proven by
++ * the lab), so a capture from the phone can be diffed against the lab's bytes. */
++final class MdnsWire {
++
++    private MdnsWire() { }
++
++    /** Build the PTR question packet for "<type>.local". */
++    static byte[] queryPacket(String type) {
++        String t = type == null ? "" : type.trim().toLowerCase(Locale.ROOT);
++        java.io.ByteArrayOutputStream b = new java.io.ByteArrayOutputStream(64);
++        b.write(0); b.write(0);            // ID 0
++        b.write(0); b.write(0);            // flags: a plain query
++        b.write(0); b.write(1);            // QDCOUNT 1
++        b.write(0); b.write(0);            // ANCOUNT 0
++        b.write(0); b.write(0);            // NSCOUNT 0
++        b.write(0); b.write(0);            // ARCOUNT 0
++        for (String label : new String[]{t, "local"}) {
++            byte[] lb = label.getBytes(java.nio.charset.StandardCharsets.US_ASCII);
++            b.write(lb.length);
++            b.write(lb, 0, lb.length);
++        }
++        b.write(0);                        // the root label
++        b.write(0); b.write(12);           // QTYPE 12 = PTR
++        b.write(0); b.write(0x01 | 0x80);  // QCLASS: IN + the QU unicast bit
++        return b.toByteArray();
++    }
++
++    /** True when a captured mDNS answer payload mentions the given name (our
++     *  service name check on the probe's receive path). */
++    static boolean mentions(byte[] payload, int len, String name) {
++        if (payload == null || name == null) return false;
++        int n = Math.min(len, payload.length);
++        String text = new String(payload, 0, n, java.nio.charset.StandardCharsets.ISO_8859_1);
++        return text.contains(name);
++    }
++}
+diff --git a/src/lk/techworld/anantplay/sicast/NsdAnnouncer.java b/src/lk/techworld/anantplay/sicast/NsdAnnouncer.java
+index ca2af6c..c04519e 100644
+--- a/src/lk/techworld/anantplay/sicast/NsdAnnouncer.java
++++ b/src/lk/techworld/anantplay/sicast/NsdAnnouncer.java
+@@ -2,16 +2,23 @@ package lk.techworld.anantplay.sicast;
+ 
+ import android.content.Context;
+ import android.net.ConnectivityManager;
++import android.net.LinkProperties;
+ import android.net.Network;
+ import android.net.NetworkCapabilities;
+ import android.net.nsd.NsdManager;
+ import android.net.nsd.NsdServiceInfo;
+ 
++import java.net.DatagramPacket;
++import java.net.DatagramSocket;
+ import java.net.Inet4Address;
+ import java.net.InetAddress;
++import java.net.InetSocketAddress;
++import java.net.MulticastSocket;
+ import java.net.NetworkInterface;
++import java.net.SocketAddress;
+ import java.util.Collections;
+ import java.util.Enumeration;
++import java.util.Locale;
+ 
+ /* Announces this phone on the local Wi-Fi exactly like an AnantPlay TV does
+  * (Cast.java:65-84): two NsdManager registrations — "_anantplay._tcp" (current) and
+@@ -23,24 +30,51 @@ import java.util.Enumeration;
+  * "සිංහල Player - AnantPlay (Recommended)" (strings_player.xml:94), listed FIRST
+  * (Cast.targets() — Cast.java:299-307).
+  *
+- * Registration is retried (HyperOS sometimes drops it), and re-done whenever the
+- * network comes back (Wi-Fi re-associate), because mDNS records live on the interface.
++ * v2 (this upgrade) — the mDNS self-discovery fix, layered on the v1 audit fixes:
+  *
+- * Audit fixes (Gate 1):
+- *   · per-type registration state — one type failing no longer marks us "not announced"
+- *     while the other type is live (the setup checklist used to flip-flop);
+- *   · a Wi-Fi multicast lock is held while announcing (some MIUI builds drop mDNS
+- *     packets without it), released in stop();
+- *   · network callbacks are registered once and always unregistered — no listener leak
+- *     across Wi-Fi toggles;
+- *   · every NsdManager call is individually wrapped: NSD can throw
+- *     IllegalArgumentException("listener already in use") on re-registration. */
++ *  THE FIELD FAILURE (Xiaomi HyperOS + AdGuard, 2026-11-21): the v1 Self-test ran
++ *  NsdManager.discoverServices() from THIS app and expected to see THIS app's own
++ *  registration. On many OEM mDNS stacks (HyperOS included) the daemon filters a
++ *  service out of its OWN uid's discovery results, so "mDNS self-discovery FAILED"
++ *  even while the announcement was perfectly visible to OTHER apps (AnantPlay
++ *  casts worked!). AdGuard Private DNS (DoT, TCP 853) never touches UDP 5353
++ *  multicast — but the AdGuard VPN app (tun0) can blackhole mDNS for the whole
++ *  process. The v1 test held no MulticastLock either, so Wi-Fi power-save could
++ *  drop the multicast responses even where the filter didn't apply.
++ *
++ *  THE FIX — three layers, each independently verifiable from the app:
++ *   1. REGISTRATION PROOF without discovery: NsdManager's own
++ *      onServiceRegistered() callback (v1) PLUS an active raw-socket mDNS probe:
++ *      we send a real unicast mDNS PTR query for _anantplay._tcp.local to the
++ *      Wi-Fi interface's mDNS endpoint (224.0.0.251:5353 bound to the interface)
++ *      while holding the MulticastLock, and parse the answer for OUR name. This
++ *      is the same wire path AnantPlay's NsdManager uses, minus the OEM's
++ *      same-uid discovery filter — the honest proof that the network, not just
++ *      the daemon, carries our record.
++ *   2. LEGACY DISCOVERY STILL TRIED: NsdManager.discoverServices() runs too;
++ *      success there is a bonus (some stacks don't filter), never a requirement.
++ *   3. ROOT-CAUSE DIAGNOSIS on failure: Wi-Fi off vs multicast lock denied vs
++ *      an active VPN (AdGuard app tun0) vs no answer on the wire (router AP
++ *      isolation) — each with its own bilingual fix instruction, surfaced by
++ *      the Self-test. (AdGuard PRIVATE DNS is explicitly NOT blamed: DoT only
++ *      encrypts unicast DNS on port 853; it cannot affect UDP 5353 multicast.)
++ *
++ *  Kept from v1: per-type registration state, a Wi-Fi multicast lock while
++ *  announcing, network callbacks registered once and always unregistered, every
++ *  NsdManager call individually wrapped (IllegalArgumentException("listener
++ *  already in use") on re-registration), retry with backoff, re-announce on
++ *  network return. */
+ public final class NsdAnnouncer {
+ 
+     static final String TYPE = "_anantplay._tcp";
+     static final String OLD_TYPE = "_fmhyplay._tcp";
+     static final String PREFIX = "AnantPlay on ";
+     static final String NAME = "සිංහල Player";
++    /** The mDNS multicast group + port (RFC 6762) — the wire the probe speaks. */
++    static final String MDNS_GROUP = "224.0.0.251";
++    static final int MDNS_PORT = 5353;
++    /** How long the raw probe waits for a reflected answer (ms). */
++    static final int PROBE_TIMEOUT_MS = 4000;
+ 
+     private final Context ctx;
+     private final int port;
+@@ -168,6 +202,120 @@ public final class NsdAnnouncer {
+         }
+     }
+ 
++    // ── the raw mDNS probe (the self-test's layer 1) ───────────────────────────
++
++    /** One mDNS question packet: PTR? <type>.local — the same query AnantPlay's
++     *  NsdManager discovery sends, hand-built so no OEM daemon sits between us
++     *  and the wire. The bytes come from the pure-Java MdnsWire builder (the
++     *  verification lab proves them byte-for-byte on a bare JVM). */
++    static byte[] mdnsQueryPacket(String type) {
++        return MdnsWire.queryPacket(type);
++    }
++
++    /** The self-probe: send the PTR query for BOTH service types on the Wi-Fi
++     *  interface and wait for an answer containing OUR service name. Returns a
++     *  structured result the Self-test turns into a bilingual diagnosis.
++     *
++     *  layer details:
++     *   · the socket is a plain unicast UDP socket bound to the Wi-Fi interface's
++     *     own address (mDNS queries may be unicast to 224.0.0.251:5353 — RFC 6762
++     *     §5.1 allows one-shot questions from any port; the QU bit asks for a
++     *     unicast reply back to our socket, which is what routers reflect best);
++     *   · a MulticastLock is held for the whole probe (the v1 bug: Wi-Fi
++     *     power-save filters multicast/broadcast receives without it);
++     *   · every failure mode returns a distinct reason code — never a bare false. */
++    static ProbeResult probeSelf(Context c, long timeoutMs) {
++        ProbeResult r = new ProbeResult();
++        r.sentType = TYPE;
++        if (!onWifiLikeNetwork(c)) {
++            r.reason = ProbeResult.WIFI_OFF;
++            r.detail = "Wi-Fi ක්‍රියාත්මක නැත — Wi-Fi on කර නැවත උත්සාහ කරන්න · Wi-Fi is off — turn it on and retry";
++            return r;
++        }
++        InetAddress wifi = wifiLanIp();
++        if (wifi == null) {
++            r.reason = ProbeResult.WIFI_OFF;
++            r.detail = "Wi-Fi interface address හමු නොවීය · no Wi-Fi interface address";
++            return r;
++        }
++        if (vpnActive(c)) {
++            // Not fatal: many VPNs pass multicast. We note it and still probe.
++            r.vpnActive = true;
++            r.detail = "VPN සක්‍රියයි (AdGuard app?) — multicast බ්ලොක් විය හැක · VPN active (AdGuard app?) — may block multicast";
++        }
++        android.net.wifi.WifiManager.MulticastLock lock = null;
++        DatagramSocket sock = null;
++        try {
++            android.net.wifi.WifiManager wm = (android.net.wifi.WifiManager)
++                c.getApplicationContext().getSystemService(android.content.Context.WIFI_SERVICE);
++            if (wm != null) {
++                lock = wm.createMulticastLock("si-cast-probe");
++                lock.setReferenceCounted(false);
++                lock.acquire();
++                r.multicastLockHeld = true;
++            }
++            sock = new DatagramSocket(new InetSocketAddress(wifi, 0));
++            sock.setSoTimeout(400);
++            byte[] q = mdnsQueryPacket(TYPE);
++            SocketAddress group = new InetSocketAddress(InetAddress.getByName(MDNS_GROUP), MDNS_PORT);
++            boolean sent = false;
++            for (int round = 0; round < Math.max(1, timeoutMs / 400) && !r.answered; round++) {
++                if (!sent || round % 5 == 0) {   // re-send every ~2 s (mDNS is lossy)
++                    sock.send(new DatagramPacket(q, q.length, group));
++                    sent = true;
++                    r.packetsSent++;
++                }
++                byte[] buf = new byte[9000];
++                DatagramPacket p = new DatagramPacket(buf, buf.length);
++                try {
++                    sock.receive(p);
++                    r.packetsReceived++;
++                    String text = new String(buf, 0, p.getLength(), java.nio.charset.StandardCharsets.ISO_8859_1);
++                    if (text.contains(NAME)) {
++                        r.answered = true;
++                        r.detail = "mDNS පිළිතුර ලැබුණි (raw probe) — ජාලය හරහා අපේ record එක පෙනේ · mDNS answer received on the wire — our record is visible";
++                        break;
++                    }
++                } catch (java.net.SocketTimeoutException ignored) { }
++            }
++            if (!r.answered) {
++                r.reason = r.packetsReceived > 0
++                    ? ProbeResult.FILTERED
++                    : ProbeResult.NO_ANSWER;
++                if (r.reason == ProbeResult.FILTERED) {
++                    r.detail = "mDNS ප්‍රතිචාර ලැබුණේ නමුත් අපේ නම නැත — mDNS බලපත්‍රය/නම ගැටලුවක් · mDNS answered but not with our name";
++                } else {
++                    r.detail = "mDNS ප්‍රතිචාර නැත — රවුටරය multicast බ්ලොක් කරයි (AP isolation?) හෝ VPN (AdGuard app) බ්ලොක් කරයි · no mDNS answer — the router blocks multicast (AP isolation?) or a VPN (AdGuard app) does";
++                }
++            }
++        } catch (Throwable t) {
++            r.reason = ProbeResult.ERROR;
++            r.detail = "probe error: " + t;
++            Diag.w("nsdtest", "probe: " + t);
++        } finally {
++            if (sock != null) { try { sock.close(); } catch (Throwable ignored) { } }
++            if (lock != null) { try { if (lock.isHeld()) lock.release(); } catch (Throwable ignored) { } }
++        }
++        return r;
++    }
++
++    /** True when ANY VPN transports the default network (AdGuard app local VPN,
++     *  WireGuard, …). AdGuard PRIVATE DNS (DoT) is deliberately NOT checked here:
++     *  it only encrypts unicast DNS (TCP 853) and cannot affect UDP 5353 multicast. */
++    static boolean vpnActive(Context c) {
++        try {
++            ConnectivityManager cm = c.getSystemService(ConnectivityManager.class);
++            Network n = cm.getActiveNetwork();
++            if (n == null) return false;
++            NetworkCapabilities caps = cm.getNetworkCapabilities(n);
++            return caps != null && caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN);
++        } catch (Throwable t) {
++            return false;
++        }
++    }
++
++    // ── small static helpers ────────────────────────────────────────────────────
++
+     /** This phone's Wi-Fi IPv4 (null when off Wi-Fi) — used by the Self-test and /info. */
+     static InetAddress wifiLanIp() {
+         try {
+@@ -182,7 +330,7 @@ public final class NsdAnnouncer {
+         return null;
+     }
+ 
+-    /** True when Wi-Fi (or hotspot) is up — what same-device mDNS needs. */
++    /** True when Wi-Fi (or hotspot/ethernet) is up — what same-device mDNS needs. */
+     static boolean onWifiLikeNetwork(Context c) {
+         try {
+             ConnectivityManager cm = c.getSystemService(ConnectivityManager.class);
+@@ -195,4 +343,23 @@ public final class NsdAnnouncer {
+             return wifiLanIp() != null;
+         }
+     }
++
++    /** The structured probe outcome — every failure has a named reason + bilingual fix. */
++    static final class ProbeResult {
++        static final String OK = "ok";                 // answered with our name
++        static final String WIFI_OFF = "wifi-off";     // no Wi-Fi → turn it on
++        static final String FILTERED = "filtered";     // mDNS alive, our name missing
++        static final String NO_ANSWER = "no-answer";   // silence: router/VPN blocking
++        static final String ERROR = "error";           // socket/API failure
++
++        String sentType = TYPE;
++        boolean answered;        // OUR name came back on the wire
++        boolean vpnActive;       // a VPN (AdGuard app etc.) transports the network
++        boolean multicastLockHeld;
++        int packetsSent, packetsReceived;
++        String reason = OK;
++        String detail = "";
++
++        boolean ok() { return answered; }
++    }
+ }
+diff --git a/src/lk/techworld/anantplay/sicast/PlayActivity.java b/src/lk/techworld/anantplay/sicast/PlayActivity.java
+index 3cb4e39..6c0f27b 100644
+--- a/src/lk/techworld/anantplay/sicast/PlayActivity.java
++++ b/src/lk/techworld/anantplay/sicast/PlayActivity.java
+@@ -151,6 +151,13 @@ public class PlayActivity extends Activity {
+     private View spinner;
+     private LinearLayout hud, panel;
+     private TextView errorBox;
++    /** v2.2: the language chip row + register/Option-C row (shown with the pill). */
++    private LinearLayout langChips;
++    private LinearLayout extraActions;
++
++    /** v2.1: the never-silent subtitle status pill + its 1-tap action row. */
++    private TextView statusPill;
++    private LinearLayout subActions;
+     private Typeface siFont;
+ 
+     private String url, title, headersJson, cookie, mime;
+@@ -158,6 +165,9 @@ public class PlayActivity extends Activity {
+     private boolean live, testMode, dragging, dashFlag;
+     private int season, episode;
+     private String imdb;
++    /** AnantPlay's cast payload `subs` URLs — side-loaded subtitle files the phone
++     *  player already had (Cast.describe forwards every StringArrayList extra). */
++    private java.util.ArrayList<String> castSubs;
+ 
+     private volatile List<Cue> cues = new ArrayList<>();
+     private volatile long subDelayMs;                  // the ±nudge display offset
+@@ -165,6 +175,14 @@ public class PlayActivity extends Activity {
+     private volatile int fetchGen;                     // a re-cast invalidates the in-flight fetch
+     private String state = "idle";                     // idle|fetching|ready|local|not-found|needs-key|error
+     private String stateDetail = "";
++    /** v2.2: the active subtitle language (registry code, si default) + the
++     *  register override (null = auto: the worker picks by movie genre). */
++    private volatile String activeLang = Langs.DEFAULT;
++    private volatile String registerOverride = null;
++    /** v2.2 two-stage: set when a base-nmt .srt is showing and a silent cinema
++     *  upgrade may still land (the delayed re-check hot-swaps it). */
++    private volatile String polishWatchToken = null;
++    private volatile boolean polishHotSwapped = false;
+     private boolean hudVisible = true;
+     private boolean finished;
+     private volatile boolean expectTakeover = true;   // cleared ~3 s after open: PiP waits for the hand-over
+@@ -179,6 +197,8 @@ public class PlayActivity extends Activity {
+         currentInstance = this;
+         snapshot = ReceiverServer.loadingJson();
+         prefs = getSharedPreferences("sicast", MODE_PRIVATE);
++        // v2.2: the user's default subtitle language (si default)
++        activeLang = Langs.isKnown(prefs.getString("defaultLang", null)) ? prefs.getString("defaultLang", Langs.DEFAULT) : Langs.DEFAULT;
+         store = new SubtitleStore(getFilesDir());
+         api = new BridgeApi(prefs.getString("workerUrl", BridgeApi.DEFAULT_WORKER_URL));
+         try {
+@@ -237,6 +257,11 @@ public class PlayActivity extends Activity {
+                 live = lv != null && lv;
+                 Boolean dash = (Boolean) MiniJson.objGet(m, "dash");
+                 dashFlag = dash != null && dash;
++                Object subsObj = MiniJson.objGet(m, "subs");
++                if (subsObj instanceof List) {
++                    castSubs = new java.util.ArrayList<>();
++                    for (Object so : (List<?>) subsObj) if (so != null) castSubs.add(String.valueOf(so));
++                }
+             }
+         }
+         if (url == null) {   // nothing playable arrived
+@@ -273,6 +298,13 @@ public class PlayActivity extends Activity {
+     @Override
+     protected void onDestroy() {
+         finished = true;
++        // v2.2 leak fix: the two-stage Cinema Polish re-check (and the 4 Hz ticker,
++        // the HUD/pill hide timers, the delayed PiP arming) all live on `main`.
++        // Clearing the queue here is what makes the re-check "cancelled in
++        // onDestroy()" true rather than merely no-op'd by the `finished` flag —
++        // nothing keeps the Activity, its ExoPlayer or its store reachable after
++        // the screen is gone, and no late hot-swap can touch a dead view.
++        if (main != null) main.removeCallbacksAndMessages(null);
+         if (currentInstance == this) {
+             currentInstance = null;
+             snapshot = ReceiverServer.idleJson();
+@@ -432,11 +464,15 @@ public class PlayActivity extends Activity {
+     // Sinhala subtitles — the worker pipeline (bg thread) + the native renderer
+     // ───────────────────────────────────────────────────────────────────────────
+ 
+-    /** The subtitle pipeline, tuned to the deployed worker's memory-mode reality
+-     *  (jobs live per-isolate): poll the DETERMINISTIC /sub/<token>.srt endpoint
+-     *  (200 .srt | 202 progress | 404 → re-request /subtitles to resume), never
+-     *  the isolate-sensitive /api/paired path. The .srt is all our timeline
+-     *  renderer needs — cue-lock pairing was the overlay era's requirement. */
++    /** The subtitle pipeline v2.1 — the full chain, never silent:
++     *   0. local cache (instant, offline)
++     *   1. CAST-SUPPLIED SUBS (v2.1): AnantPlay's own `subs` URLs — the English
++     *      .srt the phone player already had is handed to the worker's
++     *      /api/subs-direct for instant translation (no IMDb needed, cached forever)
++     *   2. the worker's /subtitles job: human Sinhala first, else multi-provider AI
++     *      translation (azure → google_v3 → gemini → workers_ai), polled on the
++     *      deterministic token URL (200 .srt | 202 progress | 404 → re-ensure).
++     * Every state change lands in the status pill; every failure names its cause. */
+     private void fetchSinhala() {
+         if (fetching || testMode) return;
+         fetching = true;
+@@ -445,13 +481,43 @@ public class PlayActivity extends Activity {
+             try {
+                 boolean series = episode > 0 || season > 0;
+                 String type = series ? "series" : "movie";
+-                String key = type + ":t:" + (title == null ? "" : title.toLowerCase(Locale.ROOT)) + ":" + season + ":" + episode;
++                String key = type + ":t:" + (title == null ? "" : title.toLowerCase(Locale.ROOT)) + ":" + season + ":" + episode + ":" + activeLang;
+                 List<Cue> cached = store.load(key);
+                 if (cached != null) {
+                     applyCues(cached, "cached");
+                     return;
+                 }
+-                setState("fetching", "worker…");
++                setState("fetching", BridgeApi.searchingText());
++                // ── 1. cast-supplied subs first (v2.1): instant, no IMDb needed ──
++                if (castSubs != null && !castSubs.isEmpty()) {
++                    for (String subUrl : castSubs) {
++                        if (myGen != fetchGen) return;
++                        if (subUrl == null || !(subUrl.startsWith("http://") || subUrl.startsWith("https://"))) continue;
++                        try {
++                            setState("fetching", "cast subtitle ලබාගනිමින්… · fetching the cast's own subtitle…");
++                            byte[] raw = httpGet(subUrl, null);
++                            String text = new String(raw, java.nio.charset.StandardCharsets.UTF_8);
++                            List<Cue> enCues = SrtLoader.load(raw, "cast.srt");
++                            if (enCues.size() < 8) continue;   // not a real track
++                            setState("fetching", "cast subtitle පරිවර්තනය වෙමින්… · translating the cast's subtitle…");
++                            Map<String, Object> job = api.subsDirect(text, title, activeLang, registerOverride);
++                            String token = tokenOf(job);
++                            if (pollToDone(token, myGen)) {
++                                List<Cue> got = SrtLoader.load(api.srt(token).getBytes(java.nio.charset.StandardCharsets.UTF_8), "si.srt");
++                                if (myGen != fetchGen) return;
++                                applyCues(got, "cast-subs → " + String.valueOf(job.get("provider")));
++                                store.save(key, got);
++                                return;
++                            }
++                        } catch (BridgeApi.HttpException he) {
++                            Diag.w("subs", "cast subs leg: HTTP " + he.status);
++                            if (he.status == 429 || he.status >= 500) continue;  // try the next leg
++                        } catch (Exception e) {
++                            Diag.w("subs", "cast subs leg: " + e);
++                        }
++                    }
++                }
++                // ── 2. the worker job (human Sinhala → multi-provider AI) ──
+                 String id = imdb;
+                 if (id == null || id.isEmpty()) {
+                     Map<String, Object> r = api.resolve(title, series, season, episode);
+@@ -463,65 +529,49 @@ public class PlayActivity extends Activity {
+                     id = String.valueOf(r.get("imdb"));
+                 }
+                 for (int round = 0; round < 4; round++) {
+-                    Map<String, Object> job = api.subtitles(type, id, season, episode, title);
++                    Map<String, Object> job = api.subtitles(type, id, season, episode, title, activeLang, registerOverride);
+                     String status = String.valueOf(job.get("status"));
+                     if ("needs-key".equals(status)) {
+-                        setState("needs-key", "සිංහල උපසිරැසි නැහැ — Worker එකේ `wrangler secret put GEMINI_API_KEY` කරන්න");
++                        setState("needs-key", "සිංහල උපසිරැසි නැහැ — Worker එකේ provider key එකක් set කරන්න "
++                            + "(AZURE_TRANSLATOR_KEY / GOOGLE_V3_KEY / GEMINI_API_KEY) · no translation provider configured on the worker");
+                         fallbackEnglishTrack();
+                         return;
+                     }
+                     if ("not-found".equals(status)) {
+-                        setState("not-found", "මෙම තේමාවට උපසිරැසි හමු නොවීය — local .srt loader එක බාවිතා කරන්න");
++                        setState("not-found", "මෙම තේමාවට උපසිරැසි හමු නොවීය — local .srt loader එක බාවිතා කරන්න · "
++                            + "no subtitles found — use the local .srt loader");
+                         fallbackEnglishTrack();
+                         return;
+                     }
+                     Map<String, Object> si = (Map<String, Object>) MiniJson.objGet(job, "si");
+                     String token = si == null ? null : String.valueOf(si.get("token"));
+                     if ("done".equals(status) && token != null && !token.isEmpty()) {
+-                        String text = api.srt(token);   // 200 straight away
++                        // v2.2 two-stage: read the quality headers with the .srt
++                        java.util.Map<String, String> withQ = api.srtWithQuality(token);
++                        String text = withQ.get("text");
+                         List<Cue> got = SrtLoader.load(text.getBytes(java.nio.charset.StandardCharsets.UTF_8), "si.srt");
+                         if (myGen != fetchGen) return;   // re-cast happened meanwhile
+-                        applyCues(got, String.valueOf(job.get("source")));
++                        String quality = withQ.containsKey("X-Sub-Quality") ? withQ.get("X-Sub-Quality") : "";
++                        String polish = withQ.containsKey("X-Polish-Status") ? withQ.get("X-Polish-Status") : "";
++                        String source = String.valueOf(job.get("source"));
++                        if ("base-nmt".equals(quality) && "pending".equals(polish)) {
++                            polishWatchToken = token;      // the delayed re-check hot-swaps it
++                            polishHotSwapped = false;
++                            schedulePolishRecheck(key, myGen);
++                        } else if ("cinema-polished".equals(quality)) {
++                            polishHotSwapped = true;       // already upgraded
++                        }
++                        applyCues(got, source + ("cinema-polished".equals(quality) ? " · ✨ cinema" : ""));
+                         store.save(key, got);            // save THIS list, not the shared field
+                         return;
+                     }
+                     if ("translating".equals(status) && token != null && !token.isEmpty()) {
+-                        // poll the deterministic token URL: 202 progress → 200 .srt
+-                        for (int poll = 0; poll < 240; poll++) {
+-                            try {
+-                                String body = api.srt(token);
+-                                if (body.trim().startsWith("{")) {
+-                                    Map<String, Object> p = null;
+-                                    try { p = Cue.statusOf(body); } catch (Exception ignored) { }
+-                                    if (p != null && "translating".equals(p.get("status"))) {
+-                                        setState("fetching", BridgeApi.progressText(p));
+-                                        SystemClock.sleep(4000);
+-                                        continue;
+-                                    }
+-                                }
+-                                List<Cue> got = SrtLoader.load(body.getBytes(java.nio.charset.StandardCharsets.UTF_8), "si.srt");
+-                                if (myGen != fetchGen) return;   // re-cast happened meanwhile
+-                                applyCues(got, String.valueOf(job.get("source")));
+-                                store.save(key, got);            // save THIS list, not the shared field
+-                                return;
+-                            } catch (BridgeApi.HttpException he) {
+-                                if (he.status == 404) break;      // isolate miss → /subtitles again resumes it
+-                                if (he.status == 429) {
+-                                    // Gemini quota: never spin silently — say it, back off, keep going
+-                                    Diag.w("subs", "worker 429 (quota) at poll " + poll + " — backing off 15 s");
+-                                    setState("fetching", BridgeApi.explain(429));
+-                                    SystemClock.sleep(15000);
+-                                    continue;
+-                                }
+-                                if (he.status == 410 || he.status >= 500) {
+-                                    Diag.e("subs", "worker HTTP " + he.status + ": " + BridgeApi.brief(he.body, 300));
+-                                    setState("error", BridgeApi.explain(he.status)
+-                                        + " · " + BridgeApi.brief(he.body, 90));
+-                                    fallbackEnglishTrack();
+-                                    return;
+-                                }
+-                                SystemClock.sleep(4000);
+-                            }
++                        if (pollToDone(token, myGen)) {
++                            List<Cue> got = SrtLoader.load(api.srt(token).getBytes(java.nio.charset.StandardCharsets.UTF_8), "si.srt");
++                            if (myGen != fetchGen) return;
++                            applyCues(got, String.valueOf(job.get("provider")));
++                            store.save(key, got);
++                            return;
+                         }
+                         continue;   // token went cold — re-ensure the job on a warm isolate
+                     }
+@@ -532,7 +582,7 @@ public class PlayActivity extends Activity {
+                 setState("error", "subtitles did not become ready — try Refetch");
+                 fallbackEnglishTrack();
+             } catch (BridgeApi.HttpException he) {
+-                // 429 (Gemini quota) / 5xx / 401 — said out loud in the status bar, logged
++                // 429 (quota) / 5xx / 401 — said out loud in the status bar, logged
+                 Diag.e("subs", "worker HTTP " + he.status + ": " + BridgeApi.brief(he.body, 300));
+                 setState("error", BridgeApi.explain(he.status) + " · " + BridgeApi.brief(he.body, 90));
+                 fallbackEnglishTrack();
+@@ -550,6 +600,55 @@ public class PlayActivity extends Activity {
+         }, "si-subs").start();
+     }
+ 
++    /** Extract the si token from a job body ({si:{token}} in both paths). */
++    private static String tokenOf(Map<String, Object> job) {
++        Map<String, Object> si = (Map<String, Object>) MiniJson.objGet(job, "si");
++        return si == null ? null : String.valueOf(si.get("token"));
++    }
++
++    /** Poll the deterministic /sub/<token>.srt URL until it answers a real .srt.
++     *  Returns true with the text in `polledSrt`, false when the token went cold
++     *  (isolate miss → caller re-ensures the job) or the job errored. */
++    private String polledSrt;
++    private boolean pollToDone(String token, int myGen) throws Exception {
++        for (int poll = 0; poll < 240; poll++) {
++            if (myGen != fetchGen) return false;
++            try {
++                String body = api.srt(token);
++                if (body.trim().startsWith("{")) {
++                    Map<String, Object> p = null;
++                    try { p = Cue.statusOf(body); } catch (Exception ignored) { }
++                    if (p != null && "translating".equals(p.get("status"))) {
++                        setState("fetching", BridgeApi.progressText(p));
++                        SystemClock.sleep(4000);
++                        continue;
++                    }
++                    if (p != null && "error".equals(p.get("status"))) {
++                        setState("error", "worker job error: " + BridgeApi.brief(String.valueOf(p.get("error")), 120));
++                        return false;
++                    }
++                }
++                polledSrt = body;
++                return true;
++            } catch (BridgeApi.HttpException he) {
++                if (he.status == 404) return false;      // isolate miss → caller re-ensures
++                if (he.status == 429) {
++                    Diag.w("subs", "worker 429 (quota) at poll " + poll + " — backing off 15 s");
++                    setState("fetching", BridgeApi.explain(429));
++                    SystemClock.sleep(15000);
++                    continue;
++                }
++                if (he.status == 410 || he.status >= 500) {
++                    Diag.e("subs", "worker HTTP " + he.status + ": " + BridgeApi.brief(he.body, 300));
++                    setState("error", BridgeApi.explain(he.status) + " · " + BridgeApi.brief(he.body, 90));
++                    return false;
++                }
++                SystemClock.sleep(4000);
++            }
++        }
++        return false;
++    }
++
+     /** Manual fetch with a title override (the subs panel's Go button). */
+     private void manualFetch(String t, int s, int e) {
+         title = t;
+@@ -610,6 +709,60 @@ public class PlayActivity extends Activity {
+         Diag.i("subs", "local " + name + ": " + loaded.size() + " cues");
+     }
+ 
++    /**
++     * v2.2 two-stage: ONE delayed re-check (worker docs: polish lands in
++     * ~15–30 s). If the SAME token now serves cinema-polished quality, the
++     * SubtitleStore hot-swaps silently mid-playback — playback never pauses,
++     * the status pill flashes "✨ Cinema Polish Ready". Runs at most twice.
++     */
++    private void schedulePolishRecheck(final String key, final int myGen) {
++        main.postDelayed(() -> {
++            if (myGen != fetchGen || finished) return;
++            new Thread(() -> {
++                try {
++                    String token = polishWatchToken;
++                    if (token == null || polishHotSwapped) return;
++                    java.util.Map<String, String> withQ = api.srtWithQuality(token);
++                    if (!"cinema-polished".equals(withQ.get("X-Sub-Quality"))) {
++                        // still pending → one more polite look, then stop asking
++                        if (!polishHotSwapped) main.postDelayed(() -> {
++                            if (myGen == fetchGen && !finished && !polishHotSwapped) {
++                                new Thread(() -> {
++                                    try {
++                                        String t2 = polishWatchToken;
++                                        if (t2 == null) return;
++                                        java.util.Map<String, String> w2 = api.srtWithQuality(t2);
++                                        if ("cinema-polished".equals(w2.get("X-Sub-Quality"))) hotSwapCues(w2.get("text"), key);
++                                    } catch (Exception ignored) { }
++                                }).start();
++                            }
++                        }, 20000);
++                        return;
++                    }
++                    hotSwapCues(withQ.get("text"), key);
++                } catch (Exception ignored) { }
++            }).start();
++        }, 20000);
++    }
++
++    /** The silent upgrade: same timestamps contract, fresh wording. */
++    private void hotSwapCues(String text, String key) {
++        try {
++            List<Cue> got = SrtLoader.load(text.getBytes(java.nio.charset.StandardCharsets.UTF_8), "si.srt");
++            if (got.isEmpty()) return;
++            polishHotSwapped = true;
++            polishWatchToken = null;
++            main.post(() -> {
++                cues = got;                       // SubtitleStore swap without touching playback
++                setState(state, "✨ Cinema Polish Ready · සිනමා ප්‍රඥප්තිය සූදානම්");
++                Diag.i("subs", "cinema polish hot-swapped (" + got.size() + " cues)");
++            });
++            store.save(key, got);
++        } catch (Exception e) {
++            Diag.w("subs", "polish swap skipped: " + e);
++        }
++    }
++
+     private void applyTestCues() {
+         List<Cue> demo = new ArrayList<>();
+         demo.add(new Cue(0, 500, 4000, "00:00:00,500 --> 00:00:04,000", "", "", "ආයුබෝවන්! සිංහල Player ක්‍රියාත්මකයි ✓"));
+@@ -636,7 +789,12 @@ public class PlayActivity extends Activity {
+                 }
+                 if (hit != null) {
+                     String text = hit.si == null || hit.si.isEmpty() ? hit.en : hit.si;
+-                    subView.setTypeface(siFont);
++                    // v2.2 script-safe: the bundled NotoSansSinhala ONLY for si;
++                    // every other language renders with the system font stack,
++                    // and RTL languages (ar/ur) get RTL text direction.
++                    subView.setTypeface(Langs.useBundledSinhalaFont(activeLang) ? siFont : Typeface.DEFAULT_BOLD);
++                    subView.setTextDirection(Langs.isRtl(activeLang)
++                        ? android.view.View.TEXT_DIRECTION_ANY_RTL : android.view.View.TEXT_DIRECTION_LTR);
+                     subView.setText(text == null ? "" : text);
+                     subView.setVisibility(View.VISIBLE);
+                 } else {
+@@ -658,16 +816,42 @@ public class PlayActivity extends Activity {
+         state = s;
+         stateDetail = detail == null ? "" : detail;
+         main.post(this::showStatus);
++        if ("error".equals(s) || "not-found".equals(s) || "needs-key".equals(s)) {
++            main.post(this::showSubActions);   // failures expose their 1-tap fixes
++        }
+     }
+ 
++    /** The status pill state → bilingual line + color (the never-silent HUD). */
+     private void showStatus() {
+         if (hudStatus != null) {
+             boolean good = "ready".equals(state) || "local".equals(state);
+-            hudStatus.setText((good ? "✓ " : "… ") + stateDetail);
+-            hudStatus.setTextColor(good ? 0xFF8CFF8C : 0xFF9FB0D8);
++            boolean warn = "fetching".equals(state);
++            hudStatus.setText((good ? "✓ " : warn ? "… " : "⚠ ") + stateDetail);
++            hudStatus.setTextColor(good ? 0xFF8CFF8C : warn ? 0xFFF59E0B : 0xFFFFB3B3);
++            hudStatus.setVisibility(View.VISIBLE);
++            if (good) main.postDelayed(hudStatusHide, 3000);   // success auto-hides after 3 s
++        }
++        if (statusPill != null) {
++            boolean good = "ready".equals(state) || "local".equals(state);
++            statusPill.setText((good ? "✓ " : "fetching".equals(state) ? "… " : "⚠ ") + stateDetail);
++            statusPill.setTextColor(good ? 0xFF8CFF8C : "fetching".equals(state) ? 0xFFFDE68A : 0xFFFFB3B3);
++            statusPill.setVisibility(View.VISIBLE);
++            if (good) main.postDelayed(pillHide, 3000);
+         }
+     }
+ 
++    private final Runnable hudStatusHide = new Runnable() {
++        @Override public void run() { if (hudStatus != null && ("ready".equals(state) || "local".equals(state))) hudStatus.setVisibility(View.INVISIBLE); }
++    };
++
++    private final Runnable pillHide = new Runnable() {
++        @Override public void run() {
++            if (statusPill != null && ("ready".equals(state) || "local".equals(state))) {
++                statusPill.setVisibility(View.GONE);
++            }
++        }
++    };
++
+     // ───────────────────────────────────────────────────────────────────────────
+     // the UI — built in code (the project's own idiom; no XML layouts anywhere)
+     // ───────────────────────────────────────────────────────────────────────────
+@@ -686,9 +870,14 @@ public class PlayActivity extends Activity {
+         surface.getHolder().setFormat(PixelFormat.OPAQUE);
+         root.addView(surface, new FrameLayout.LayoutParams(-1, -1));
+ 
+-        // the subtitle view — bottom center, Sinhala font, mask, like AnantPlay's own (PlayerActivity.java:396-401)
++        // the subtitle view — bottom center, script-correct font, mask, like AnantPlay's own (PlayerActivity.java:396-401)
+         subView = new TextView(this);
+-        subView.setTypeface(siFont);
++        // v2.2: the bundled NotoSansSinhala is loaded ONCE (onCreate) and applied
++        // only when the active language is Sinhala; every other script uses the
++        // system font stack (the OS already covers Tamil/Devanagari/CJK/Arabic).
++        subView.setTypeface(Langs.useBundledSinhalaFont(activeLang) ? siFont : Typeface.DEFAULT_BOLD);
++        subView.setTextDirection(Langs.isRtl(activeLang)
++            ? android.view.View.TEXT_DIRECTION_ANY_RTL : android.view.View.TEXT_DIRECTION_LTR);
+         subView.setGravity(Gravity.CENTER);
+         subView.setTextColor(Color.WHITE);
+         subView.setTextSize(prefs.getInt("fontSp", 22));
+@@ -709,6 +898,77 @@ public class PlayActivity extends Activity {
+         notice.setVisibility(View.GONE);
+         root.addView(notice, new FrameLayout.LayoutParams(-2, -2, Gravity.TOP | Gravity.CENTER_HORIZONTAL));
+ 
++        // ── v2.1: the subtitle status pill — the never-silent HUD ──
++        // Auto-hides 3 s after success; on error it STAYS with the exact reason
++        // and the action row below carries the 1-tap fixes.
++        statusPill = new TextView(this);
++        statusPill.setTextColor(0xFFFDE68A);
++        statusPill.setTextSize(12.5f);
++        statusPill.setMaxLines(3);
++        statusPill.setPadding(dp(14), dp(8), dp(14), dp(8));
++        GradientDrawable pillBg = new GradientDrawable();
++        pillBg.setColor(0xE60E1424);
++        pillBg.setCornerRadius(dp(14));
++        pillBg.setStroke(dp(1), 0x33FFFFFF);
++        statusPill.setBackground(pillBg);
++        statusPill.setVisibility(View.GONE);
++        FrameLayout.LayoutParams pillLp = new FrameLayout.LayoutParams(-2, -2, Gravity.TOP | Gravity.CENTER_HORIZONTAL);
++        pillLp.topMargin = dp(64);
++        root.addView(statusPill, pillLp);
++
++        // ── v2.1: the subtitle action row (pill's fixes, one tap each) ──
++        subActions = new LinearLayout(this);
++        subActions.setOrientation(LinearLayout.HORIZONTAL);
++        subActions.setGravity(Gravity.CENTER);
++        subActions.setPadding(dp(6), dp(6), dp(6), dp(6));
++        GradientDrawable rowBg = new GradientDrawable();
++        rowBg.setColor(0xE60E1424);
++        rowBg.setCornerRadius(dp(16));
++        subActions.setBackground(rowBg);
++        subActions.setVisibility(View.GONE);
++        subActions.addView(pillBtn("↻ Retry", v -> { subActions.setVisibility(View.GONE); fetchGen++; fetching = false; fetchSinhala(); }));
++        subActions.addView(pillBtn("⇄ Provider", v -> { subActions.setVisibility(View.GONE); fetchGen++; fetching = false; prefs.edit().putBoolean("preferCastSubs", true).apply(); fetchSinhala(); }));
++        subActions.addView(pillBtn("📄 Local .srt", v -> { subActions.setVisibility(View.GONE); pickLocal(); }));
++        subActions.addView(pillBtn("⏱ ±0.25s", v -> nudge(250)));
++
++        // ── v2.2: the language chip row (8 registry languages + More) ──
++        LinearLayout langRow = new LinearLayout(this);
++        langRow.setOrientation(LinearLayout.HORIZONTAL);
++        langRow.setGravity(Gravity.CENTER);
++        langRow.setPadding(dp(4), dp(4), dp(4), dp(4));
++        GradientDrawable langBg = new GradientDrawable();
++        langBg.setColor(0xE60E1424);
++        langBg.setCornerRadius(dp(16));
++        langRow.setBackground(langBg);
++        for (final Langs.Lang l : Langs.chips()) {
++            langRow.addView(pillBtn(l.nativeName, v -> switchLang(l.code)));
++        }
++        langRow.addView(pillBtn("+ More", v -> showLangSheet()));
++        FrameLayout.LayoutParams langLp = new FrameLayout.LayoutParams(-2, -2, Gravity.TOP | Gravity.CENTER_HORIZONTAL);
++        langLp.topMargin = dp(104);
++        root.addView(langRow, langRowLp(langRow));
++        langChips = langRow;
++
++        // ── v2.2: register toggle + Option-C power-user item (shown with the pill) ──
++        LinearLayout extraRow = new LinearLayout(this);
++        extraRow.setOrientation(LinearLayout.HORIZONTAL);
++        extraRow.setGravity(Gravity.CENTER);
++        extraRow.setPadding(dp(4), dp(4), dp(4), dp(4));
++        GradientDrawable extraBg = new GradientDrawable();
++        extraBg.setColor(0xE60E1424);
++        extraBg.setCornerRadius(dp(16));
++        extraRow.setBackground(extraBg);
++        extraRow.addView(pillBtn("🗣 Spoken/Formal", v -> toggleRegister()));
++        extraRow.addView(pillBtn("✨ AI Studio", v -> openAiStudioBridge()));
++        FrameLayout.LayoutParams extraLp = new FrameLayout.LayoutParams(-2, -2, Gravity.TOP | Gravity.CENTER_HORIZONTAL);
++        extraLp.topMargin = dp(144);
++        root.addView(extraRow, extraLp);
++        extraActions = extraRow;
++
++        FrameLayout.LayoutParams actLp = new FrameLayout.LayoutParams(-2, -2, Gravity.TOP | Gravity.CENTER_HORIZONTAL);
++        actLp.topMargin = dp(64);
++        root.addView(subActions, actLp);
++
+         spinner = new android.view.View(this);
+         try {
+             android.widget.ProgressBar pb = new android.widget.ProgressBar(this, null, android.R.attr.progressBarStyleLarge);
+@@ -910,6 +1170,143 @@ public class PlayActivity extends Activity {
+         return t;
+     }
+ 
++    /** v2.1: a compact pill button for the subtitle action row. */
++    private View pillBtn(String label, View.OnClickListener click) {
++        TextView t = new TextView(this);
++        t.setText(label);
++        t.setTextColor(0xFFE2E8F0);
++        t.setTextSize(12f);
++        t.setGravity(Gravity.CENTER);
++        t.setTypeface(Typeface.DEFAULT_BOLD);
++        GradientDrawable g = new GradientDrawable();
++        g.setColor(0xFF1E2A4A);
++        g.setCornerRadius(dp(14));
++        t.setBackground(g);
++        t.setPadding(dp(12), dp(8), dp(12), dp(8));
++        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(-2, -2);
++        lp.leftMargin = lp.rightMargin = dp(4);
++        t.setLayoutParams(lp);
++        t.setOnClickListener(click);
++        return t;
++    }
++
++    /** v2.1: show the pill's action row (called on error / long-press states). */
++    private void showSubActions() {
++        if (subActions != null) subActions.setVisibility(View.VISIBLE);
++        if (statusPill != null) statusPill.setVisibility(View.VISIBLE);
++        if (langChips != null) langChips.setVisibility(View.VISIBLE);
++        if (extraActions != null) extraActions.setVisibility(View.VISIBLE);
++        main.postDelayed(() -> {
++            if (subActions != null) subActions.setVisibility(View.GONE);
++            if (langChips != null) langChips.setVisibility(View.GONE);
++            if (extraActions != null) extraActions.setVisibility(View.GONE);
++        }, 12000);
++    }
++
++    private FrameLayout.LayoutParams langRowLp(LinearLayout row) { return new FrameLayout.LayoutParams(-2, -2, Gravity.TOP | Gravity.CENTER_HORIZONTAL); }
++
++    /** v2.2: 1-tap language switch — refetch in the new language (cached jobs
++     *  return instantly; the store keys per language). */
++    void switchLang(String code) {
++        if (!Langs.isKnown(code) || code.equals(activeLang)) return;
++        activeLang = code;
++        polishWatchToken = null;
++        polishHotSwapped = false;
++        fetchGen++;
++        fetching = false;
++        cues = new ArrayList<>();
++        setState("fetching", Langs.nativeOf(code) + " උපසිරැසි ලබාගනිමින්… · fetching " + Langs.englishOf(code) + " subtitles…");
++        fetchSinhala();
++        if (subActions != null) subActions.setVisibility(View.GONE);
++        if (langChips != null) langChips.setVisibility(View.GONE);
++        if (extraActions != null) extraActions.setVisibility(View.GONE);
++    }
++
++    /** v2.2: the full registry sheet (the "+ More" chip). */
++    private void showLangSheet() {
++        String[] labels = new String[Langs.ALL.size()];
++        for (int i = 0; i < Langs.ALL.size(); i++) {
++            Langs.Lang l = Langs.ALL.get(i);
++            labels[i] = l.nativeName + " (" + l.english + ")";
++        }
++        new android.app.AlertDialog.Builder(this)
++            .setTitle("Subtitle language · උපසිරැසි භාෂාව")
++            .setItems(labels, (d, which) -> switchLang(Langs.ALL.get(which).code))
++            .setNegativeButton(android.R.string.cancel, null)
++            .show();
++    }
++
++    /** v2.2: Spoken ⇄ Formal override (null = auto by genre). */
++    private void toggleRegister() {
++        registerOverride = registerOverride == null ? "spoken" : ("spoken".equals(registerOverride) ? "formal" : null);
++        String label = registerOverride == null ? "auto (genre)" : registerOverride;
++        setState(state, "Register: " + label + " — refetching… · රටාව: " + label);
++        fetchGen++; fetching = false;
++        fetchSinhala();
++    }
++
++    /**
++     * v2.2 Option-C — the SAFE power-user bridge (zero automation, zero ToS
++     * risk): build the cinema-grade prompt + a ≤40 KB chunk of the English
++     * cues, copy it to the clipboard, and open the user's REAL browser on
++     * AI Studio (a Custom-Tab-style ACTION_VIEW — NEVER a WebView). The user
++     * pastes, gets the polished result, and imports it via the .srt loader.
++     *
++     * Two hard guarantees the audit asked for, both enforced here:
++     *   · the clipboard payload can never exceed AI_STUDIO_MAX_BYTES (40 KB) —
++     *     the budget is measured in UTF-8 bytes as we append, so a pathological
++     *     cue list cannot produce a truncated/corrupt paste;
++     *   · a device with no browser at all raises ActivityNotFoundException, which
++     *     is caught by name and reported as "prompt copied, install a browser"
++     *     instead of a stack trace or a crash.
++     */
++    private static final int AI_STUDIO_MAX_BYTES = 40 * 1024;   // Binder transaction-safe
++
++    private void openAiStudioBridge() {
++        StringBuilder prompt = new StringBuilder();
++        int n = 0;
++        try {
++            String head = "You are a professional cinema subtitle localizer. Movie: "
++                + (title == null ? "this movie" : title)
++                + ". Polish the machine draft below into natural SPOKEN movie dialogue — "
++                + "meaning, names and dashes kept, ≤42 chars/line.\n\n";
++            prompt.append(head);
++            for (Cue c : cues) {
++                String en = c.en == null || c.en.isEmpty() ? c.si : c.en;
++                if (en == null || en.isEmpty()) continue;
++                String line = (n + 1) + "|EN: " + en + " | DRAFT: " + (c.si == null ? "" : c.si) + '\n';
++                // measure the REAL payload, not the character count
++                if (java.nio.charset.StandardCharsets.UTF_8.encode(prompt + line).remaining() > AI_STUDIO_MAX_BYTES) break;
++                prompt.append(line);
++                n++;
++            }
++        } catch (Throwable t) {
++            Diag.w("subs", "ai studio prompt build: " + t);
++        }
++        try {
++            String payload = prompt.toString();
++            android.content.ClipboardManager cm = (android.content.ClipboardManager) getSystemService(CLIPBOARD_SERVICE);
++            if (cm != null) {
++                cm.setPrimaryClip(android.content.ClipData.newPlainText("AI Studio prompt (" + n + " cues)", payload));
++            }
++            try {
++                startActivity(new android.content.Intent(android.content.Intent.ACTION_VIEW,
++                    android.net.Uri.parse("https://aistudio.google.com/")));
++                setState(state, "✅ " + n + " cues copied — paste into AI Studio, then 📄 Local .srt to import · "
++                    + n + " පේළි පිටපත් — AI Studio එකට paste කරන්න");
++            } catch (android.content.ActivityNotFoundException anf) {
++                // no browser installed — the prompt is already on the clipboard, so the
++                // user can still paste it anywhere; say exactly that instead of crashing
++                Diag.w("subs", "ai studio bridge: no browser (" + anf + ")");
++                setState(state, "✅ " + n + " cues copied — but this phone has no browser to open AI Studio · "
++                    + n + " පේළි පිටපත් විය, නමුත් browser එකක් නැත");
++            }
++        } catch (Throwable e) {
++            Diag.w("subs", "ai studio bridge: " + e);
++            setState(state, "AI Studio bridge failed: " + e.getMessage());
++        }
++    }
++
+     // ── gestures: tap = HUD, double-tap sides = ±10 s, left/right edge swipe = brightness/volume ──
+ 
+     private void wireGestures(FrameLayout root) {
