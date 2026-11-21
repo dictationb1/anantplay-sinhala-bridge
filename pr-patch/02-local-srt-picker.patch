@@ -1,0 +1,139 @@
+diff --git a/res/values/strings_player.xml b/res/values/strings_player.xml
+index 24db09c..b0ae081 100644
+--- a/res/values/strings_player.xml
++++ b/res/values/strings_player.xml
+@@ -45,6 +45,7 @@
+     <string name="player_no_audio">No audio in this video</string>
+     <string name="player_no_subs">No subtitles in this video</string>
+     <string name="player_search_subs">"🔍  Search subtitles…"</string>
++    <string name="player_open_local_srt">"📁  Open local .srt…"</string>
+     <string name="player_season_episode">"Season %1$d  ·  Episode %2$d"</string>
+     <string name="player_episode">Episode %1$d</string>
+     <string name="player_searching_subs">Searching OpenSubtitles…</string>
+diff --git a/src/me/champdev/weblock/PlayerActivity.java b/src/me/champdev/weblock/PlayerActivity.java
+index b242489..13c54d2 100644
+--- a/src/me/champdev/weblock/PlayerActivity.java
++++ b/src/me/champdev/weblock/PlayerActivity.java
+@@ -69,6 +69,7 @@ public class PlayerActivity extends Activity {
+     static long carryMs, carryAt;
+     static PlayerActivity current;   // the open player, for casts to this TV (Cast)
+     static final int REQ_CAST = 7;
++    static final int REQ_LOCAL_SRT = 8;   // ACTION_OPEN_DOCUMENT: a local .srt the user picked
+     String casting;                  // the TV this video was sent to, while the phone is its remote
+     static final float[] SPEEDS = {0.5f, 0.75f, 1f, 1.25f, 1.5f, 2f};
+     static final int GESTURE_BAR_DP = 140;
+@@ -1646,10 +1647,14 @@ public class PlayerActivity extends Activity {
+         if (!search && (labels.isEmpty() || (canOff && labels.size() == 1))) { say(App.t(type == C.TRACK_TYPE_TEXT ? R.string.player_no_subs : R.string.player_no_audio)); return; }
+         int searchAt = search ? labels.size() : -1;
+         if (search) labels.add(App.t(R.string.player_search_subs));
++        // Open a local .srt (Baiscope/Zoom downloads): picked through ACTION_OPEN_DOCUMENT, normalized to UTF-8 like a fetched one
++        int localAt = type == C.TRACK_TYPE_TEXT ? labels.size() : -1;
++        if (localAt >= 0) labels.add(App.t(R.string.player_open_local_srt));
+         int positionAt = type == C.TRACK_TYPE_TEXT ? labels.size() : -1;
+         if (positionAt >= 0) labels.add(App.t(R.string.home_tab_settings));   // size, position, color, background, timing
+         sheet(name, labels.toArray(new String[0]), (d, i) -> {
+             if (i == searchAt) { searchSubs(); return; }
++            if (i == localAt) { openLocalSrt(); return; }
+             if (i == positionAt) { subtitleStyle(); return; }
+             // Off keeps a file or track picked before from coming back; a track of the stream replaces a file; either way the next resume does the same
+             if (type == C.TRACK_TYPE_TEXT) for (String k : subKeys(false)) {
+@@ -2339,6 +2344,40 @@ public class PlayerActivity extends Activity {
+         });
+     }
+ 
++    /** Opens a local .srt/.vtt the user downloaded themselves (Baiscope, Zoom, a share): ACTION_OPEN_DOCUMENT, no storage permission. */
++    void openLocalSrt() {
++        try {
++            android.content.Intent pick = new android.content.Intent(android.content.Intent.ACTION_OPEN_DOCUMENT);
++            pick.addCategory(android.content.Intent.CATEGORY_OPENABLE);
++            pick.setType("*/*");
++            pick.putExtra(android.content.Intent.EXTRA_MIME_TYPES, new String[]{"application/x-subrip", "application/octet-stream", "text/plain", "text/vtt"});
++            startActivityForResult(pick, REQ_LOCAL_SRT);
++        } catch (android.content.ActivityNotFoundException e) {
++            say(App.t(R.string.player_subs_failed));
++        }
++    }
++
++    /** The picked file: read, charset-normalized and line-cleaned to UTF-8 exactly like a fetched one (SubFetch.pick's rules), then shown. */
++    void showLocalSrt(Uri uri) {
++        App.io.execute(() -> {
++            SubFetch.Fetched f = null;
++            String name = fileName(String.valueOf(uri));
++            try (InputStream in = getContentResolver().openInputStream(uri)) {
++                if (in != null) f = SubFetch.normalize(SubOs.read(in, SubFetch.MAX, "local subtitle"), fileName(name));
++            } catch (Exception e) { }
++            final SubFetch.Fetched got = f;
++            runOnUiThread(() -> {
++                if (player == null || isFinishing()) return;
++                if (got == null) { say(App.t(R.string.player_subs_failed)); return; }
++                Subs.Sub local = new Subs.Sub();
++                local.lang = "";
++                local.source = name;
++                local.release = name;
++                showSubtitle(local, got);
++            });
++        });
++    }
++
+     void showSubtitle(Subs.Sub sub, SubFetch.Fetched f) {
+         String mime = f.ext.equals("vtt") ? MimeTypes.TEXT_VTT : f.ext.equals("srt") ? MimeTypes.APPLICATION_SUBRIP : MimeTypes.TEXT_SSA;
+         subList.removeIf(c -> "opensubtitles".equals(c.id));
+@@ -2543,6 +2582,10 @@ public class PlayerActivity extends Activity {
+ 
+     @Override protected void onActivityResult(int req, int res, android.content.Intent data) {
+         super.onActivityResult(req, res, data);
++        if (req == REQ_LOCAL_SRT) {   // a local .srt picked with ACTION_OPEN_DOCUMENT (openLocalSrt)
++            if (res == android.app.Activity.RESULT_OK && data != null && data.getData() != null) showLocalSrt(data.getData());
++            return;
++        }
+         if (req != REQ_CAST || player == null) return;
+         if (data != null && data.hasExtra("at")) {
+             // Stopped casting (or the TV closed the video): carry on here from where the TV was
+diff --git a/src/me/champdev/weblock/SubFetch.java b/src/me/champdev/weblock/SubFetch.java
+index d907b2d..6703a43 100644
+--- a/src/me/champdev/weblock/SubFetch.java
++++ b/src/me/champdev/weblock/SubFetch.java
+@@ -89,6 +89,43 @@ final class SubFetch {
+         return r;
+     }
+ 
++    /** A local file's bytes, normalized exactly like a fetched one (BOM stripped, newlines unified, UTF-8, ext sniffed) —
++     * the local .srt picker's path. Throws (a null return never happens) when the bytes are not a subtitle. */
++    static Fetched normalize(byte[] b, String name) throws IOException {
++        String entryExt = "";
++        if (b.length > 1 && (b[0] & 0xff) == 0x1f && (b[1] & 0xff) == 0x8b) {
++            try (InputStream z = new GZIPInputStream(new ByteArrayInputStream(b))) {
++                b = SubOs.read(z, MAX, "unpacked subtitle");
++            }
++        } else if (b.length > 3 && b[0] == 'P' && b[1] == 'K' && b[2] == 3 && b[3] == 4) {
++            Object[] best = unzip(b);
++            b = (byte[]) best[0];
++            entryExt = (String) best[1];
++        }
++        String x = name == null ? "" : name.toLowerCase(Locale.ROOT);
++        x = x.lastIndexOf('.') < 0 ? "" : x.substring(x.lastIndexOf('.') + 1);
++        if (x.equals("ass") || x.equals("ssa")) entryExt = x;
++
++        Charset cs = pick(b, null, null);
++        String t = new String(b, cs);
++        if (t.startsWith("﻿")) t = t.substring(1);
++        t = t.replace("\r\n", "\n").replace('\r', '\n');
++        int end = t.length();
++        while (end > 0 && Character.isWhitespace(t.charAt(end - 1))) end--;
++        t = t.substring(0, end);
++
++        String ext = t.startsWith("WEBVTT") ? "vtt" : t.contains("[Script Info]") || entryExt.equals("ass") || entryExt.equals("ssa") ? "ass" : "srt";
++        if (!ext.equals("ass") && !t.contains("-->")) throw new IOException("not a subtitle file");
++
++        File dir = new File(App.app.getCacheDir(), "subs");
++        if (!dir.isDirectory() && !dir.mkdirs()) throw new IOException("cannot create " + dir);
++        File out = File.createTempFile("local", "." + ext, dir);
++        try (OutputStream o = new FileOutputStream(out)) {
++            o.write(t.getBytes(StandardCharsets.UTF_8));
++        }
++        return result(out, ext, "UTF-8");
++    }
++
+     /** The best subtitle in a zip: .srt, then .ass/.ssa, then .vtt (nfo, txt, url and the rest are skipped). Entry names are only read for their extension. */
+     private static Object[] unzip(byte[] zip) throws IOException {
+         byte[] best = null;

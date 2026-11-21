@@ -1,0 +1,230 @@
+diff --git a/src/me/champdev/weblock/SubDl.java b/src/me/champdev/weblock/SubDl.java
+new file mode 100644
+index 0000000..ea66757
+--- /dev/null
++++ b/src/me/champdev/weblock/SubDl.java
+@@ -0,0 +1,81 @@
++package me.champdev.weblock;
++
++import org.json.JSONArray;
++import org.json.JSONException;
++import org.json.JSONObject;
++
++import java.io.IOException;
++import java.io.InputStream;
++import java.util.ArrayList;
++import java.util.List;
++import java.util.Locale;
++
++/**
++ * SubDL's subtitle search (subdl.com, a user-supplied API key in Settings): Sinhala and English files for an IMDb
++ * title or episode, returned the same shape as {@link SubOs.Result} so Subs.search can merge them. Downloads are
++ * ZIPs, which {@link SubFetch} already unpacks. Android-free; the caller supplies the connection.
++ */
++final class SubDl {
++    static final String BASE = "https://api.subdl.com/api/v1/subtitles?";
++    static final int MAX_ANSWER = 4 * 1024 * 1024;
++
++    /** The key the user typed in Settings (empty = SubDL stays off). */
++    static String key() {
++        return App.prefs.getString("subdlKey", "");
++    }
++
++    static void setKey(String key) {
++        App.prefs.edit().putString("subdlKey", key == null ? "" : key.trim()).apply();
++    }
++
++    /** One file SubDL offered. */
++    static final class Result {
++        String url, lang, release, format;
++        boolean hearingImpaired;
++    }
++
++    /** Subs.Sub-shaped search: the languages are SubDL's own codes; Sinhala is "si", English "en". */
++    static List<Result> search(SubOs.Http http, String imdb, int season, int episode, String lang) throws IOException {
++        String digits = imdb == null ? "" : imdb.trim().replaceFirst("^(?i)tt", "");
++        if (!digits.matches("\\d{1,9}")) throw new IOException("bad IMDb id: " + imdb);
++        String key = key();
++        if (key.isEmpty()) return new ArrayList<>();   // no key, no ask — never a failure for the caller
++        String code = lang == null ? "" : lang.trim().toLowerCase(Locale.ROOT);
++        // SubDL's Sinhala code is "si" where OpenSubtitles' is "sin"; anything else passes through as given.
++        if (code.equals("sin")) code = "si";
++        StringBuilder u = new StringBuilder(BASE)
++            .append("imdb_id=tt").append(digits)
++            .append("&key=").append(key)
++            .append("&dl=1&languages=").append(code.isEmpty() ? "si,en" : code);
++        if (season > 0 || episode > 0) {
++            u.append("&season=").append(Math.max(0, season)).append("&episode=").append(Math.max(0, episode));
++        }
++        String body;
++        try (InputStream in = http.open(u.toString())) {
++            body = new String(SubOs.read(in, MAX_ANSWER, "answer"), java.nio.charset.StandardCharsets.UTF_8).trim();
++        }
++        List<Result> out = new ArrayList<>();
++        try {
++            JSONObject j = new JSONObject(body);
++            JSONArray a = j.optJSONArray("subtitles");
++            if (a != null) {
++                for (int i = 0; i < a.length() && out.size() < 40; i++) {
++                    JSONObject s = a.optJSONObject(i);
++                    if (s == null) continue;
++                    String dl = s.optString("url", "");
++                    if (dl.isEmpty()) continue;
++                    Result r = new Result();
++                    r.url = dl.startsWith("/") ? "https://dl.subdl.com" + dl : dl;
++                    r.lang = s.optString("language", code);
++                    r.release = s.optString("release_name", s.optString("name", ""));
++                    r.format = "srt";
++                    r.hearingImpaired = false;
++                    out.add(r);
++                }
++            }
++        } catch (JSONException e) {
++            throw new IOException("bad SubDL answer: " + e.getMessage());
++        }
++        return out;
++    }
++}
+diff --git a/src/me/champdev/weblock/Subs.java b/src/me/champdev/weblock/Subs.java
+index c6f15b3..716b93a 100644
+--- a/src/me/champdev/weblock/Subs.java
++++ b/src/me/champdev/weblock/Subs.java
+@@ -75,6 +75,20 @@ final class Subs {
+             List<Sub> sample = find(imdb, season, episode);
+             if (sample != null) { asked = true; for (Sub s : sample) if (osCode(s.lang).equals(code)) out.add(s); }
+         }
++        // SubDL's files for the same language, after OpenSubtitles' (only when a key was given in Settings; single
++        // episodes only: a season pack's zip holds the wrong ones). An unreachable or empty answer adds nothing.
++        try {
++            for (SubDl.Result r : SubDl.search(HTTP, imdb, season, episode, lang)) {
++                Sub s = new Sub();
++                s.url = r.url;
++                s.lang = r.lang.isEmpty() ? code : r.lang;
++                s.release = r.release.isEmpty() ? "SubDL" : r.release;
++                s.source = "SubDL";
++                s.encoding = "";
++                s.hearingImpaired = r.hearingImpaired;
++                if (!s.url.isEmpty() && !out.contains(s)) out.add(s);
++            }
++        } catch (java.io.IOException ignored) { }
+         return asked ? out : null;
+     }
+ 
+diff --git a/test/SubDlTest.java b/test/SubDlTest.java
+new file mode 100644
+index 0000000..ad44646
+--- /dev/null
++++ b/test/SubDlTest.java
+@@ -0,0 +1,112 @@
++// Tests SubDl.java (SubDL subtitle provider behind a user key). From the project folder, with the org.json jar:
++// javac --release 8 -cp $JSON -d /tmp/subdl $(find test/stubs -name '*.java') src/me/champdev/weblock/SubOs.java src/me/champdev/weblock/SubDl.java test/SubDlTest.java && java -cp /tmp/subdl:$JSON me.champdev.weblock.SubDlTest
++// The whole test is offline: the Http connection is a stub returning synthetic answers, and the key rides the
++// same App.prefs stub the other JVM tests use.
++package me.champdev.weblock;
++
++import org.json.JSONArray;
++import org.json.JSONObject;
++
++import java.io.ByteArrayInputStream;
++import java.io.IOException;
++import java.io.InputStream;
++import java.nio.charset.StandardCharsets;
++import java.util.List;
++
++public class SubDlTest {
++    static int fails;
++
++    static void check(String name, Object got, Object want) {
++        if (got == null ? want != null : !got.equals(want)) { fails++; System.out.println("FAIL " + name + ": got " + got + " want " + want); }
++    }
++
++    /** Serves one canned body per call, and records every URL asked. */
++    static class Http implements SubOs.Http {
++        String asked;
++        String serve = "";
++
++        public InputStream open(String url) throws IOException {
++            asked = url;
++            if (serve.startsWith("!")) throw new IOException("offline");
++            return new ByteArrayInputStream(serve.getBytes(StandardCharsets.UTF_8));
++        }
++    }
++
++    static String answer(String... files) {
++        JSONObject j = new JSONObject();
++        JSONArray a = new JSONArray();
++        for (String f : files) {
++            JSONObject o = new JSONObject();
++            o.put("url", "/subtitle/" + f + ".zip");
++            o.put("language", "si");
++            o.put("release_name", f);
++            a.put(o);
++        }
++        j.put("subtitles", a);
++        return j.toString();
++    }
++
++    public static void main(String[] args) throws Exception {
++        System.out.println("SubDlTest");
++        Http http = new Http();
++
++        // 1. no key → empty list, and NOTHING asked from the network
++        SubDl.setKey("");
++        List<SubDl.Result> none = SubDl.search(http, "tt0903747", 1, 1, "sin");
++        check("no key returns empty", none.size(), 0);
++        check("no key asks nothing", http.asked, null);
++
++        // 2. key + a Sinhala answer → url, lang, release mapped; sin asked as si
++        SubDl.setKey("TESTKEY");
++        http.serve = answer("dark.s01e01.si");
++        List<SubDl.Result> one = SubDl.search(http, "tt0903747", 1, 1, "sin");
++        check("one result", one.size(), 1);
++        check("url is dl host", one.get(0).url, "https://dl.subdl.com/subtitle/dark.s01e01.si.zip");
++        check("lang kept", one.get(0).lang, "si");
++        check("release kept", one.get(0).release, "dark.s01e01.si");
++        check("sin mapped to si in url", http.asked.contains("languages=si"), true);
++        check("imdb sent", http.asked.contains("imdb_id=tt0903747"), true);
++        check("key sent", http.asked.contains("key=TESTKEY"), true);
++        check("season/episode sent", http.asked.contains("season=1") && http.asked.contains("episode=1"), true);
++
++        // 3. movie (season 0) → no season/episode params
++        http.serve = answer("movie.si");
++        List<SubDl.Result> movie = SubDl.search(http, "tt0133093", 0, 0, "si");
++        check("movie no season param", http.asked.contains("season="), false);
++        check("movie result url", movie.get(0).url, "https://dl.subdl.com/subtitle/movie.si.zip");
++
++        // 4. season pack (season > 0, episode 0) → still a series query, season only
++        http.serve = answer("pack.si");
++        SubDl.search(http, "tt0903747", 2, 0, "si");
++        check("season-only query", http.asked.contains("season=2") && http.asked.contains("episode=0"), true);
++
++        // 5. bad IMDb → IOException, never a network call
++        http.asked = null;
++        try { SubDl.search(http, "nonsense", 0, 0, "si"); fails++; System.out.println("FAIL bad imdb: no exception"); }
++        catch (IOException e) { check("bad imdb asked nothing", http.asked, null); }
++
++        // 6. not JSON → IOException (a quota page must not pass as an empty-but-fine answer)
++        http.serve = "<html>quota exceeded</html>";
++        try { SubDl.search(http, "tt0903747", 1, 1, "si"); fails++; System.out.println("FAIL html answer: no exception"); }
++        catch (IOException e) { }
++
++        // 7. offline → IOException
++        http.serve = "!offline";
++        try { SubDl.search(http, "tt0903747", 1, 1, "si"); fails++; System.out.println("FAIL offline: no exception"); }
++        catch (IOException e) { }
++
++        // 8. empty list (no subtitles key) → empty, fine
++        http.serve = "{}";
++        List<SubDl.Result> empty = SubDl.search(http, "tt0903747", 1, 1, "si");
++        check("empty answer empty list", empty.size(), 0);
++
++        // 9. key trimming + clearing
++        SubDl.setKey("  KEY2  ");
++        check("key trimmed", SubDl.key(), "KEY2");
++        SubDl.setKey(null);
++        check("null key cleared", SubDl.key(), "");
++
++        System.out.println(fails == 0 ? "OK" : fails + " FAILURES");
++        if (fails > 0) System.exit(1);
++    }
++}

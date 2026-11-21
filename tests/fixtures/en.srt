@@ -1,0 +1,11 @@
+1
+00:00:01,000 --> 00:00:03,500
+Hello world! This is a synthetic test cue.
+
+2
+00:00:04,000 --> 00:00:06,000
+Second synthetic line
+
+3
+00:00:07,000 --> 00:00:09,000
+Third synthetic line

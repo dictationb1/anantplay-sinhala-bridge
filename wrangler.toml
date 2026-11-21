@@ -1,0 +1,37 @@
+# AnantPlay Sinhala Subtitle Bridge — Cloudflare Worker (free tier)
+# One unified worker serves BOTH the Bridge UI (/index.html, /app.js, /style.css) and the
+# real /sub/<token>.srt endpoints, from a single origin.
+#
+# Zero-config deploy: `npx wrangler deploy` just works — no KV namespace required.
+# Without a KV binding the worker stores subtitles in the Cache API (per-colo, 24h), so the
+# bridge is usable on the free tier immediately. For subtitles that must survive a cache
+# eviction and be readable from every colo, bind KV (recommended):
+#
+#   npx wrangler kv namespace create SUBS_KV        # prints an id
+#   # then uncomment the block below and paste the id in
+#
+name = "anantplay-si-subs-bridge"
+main = "worker/src/index.js"
+compatibility_date = "2024-10-01"
+
+# Static Bridge UI, served by Cloudflare's asset layer on the same origin as the API.
+# Only non-asset paths (/index.json, /sites.json, /deeplinks.json, /api/*, /sub/*) reach the Worker.
+[assets]
+directory = "./bridge-ui/public"
+binding = "ASSETS"
+
+# Optional KV store (recommended, free tier). Commented out so `wrangler deploy` works with
+# no namespace id and CI's `wrangler deploy --dry-run` stays green.
+# [[kv_namespaces]]
+# binding = "SUBS_KV"
+# id = "PASTE_32_HEX_NAMESPACE_ID_HERE"
+
+# Optional: extra subtitle hosts /api/fetch-sub may download from (the built-in allowlist is
+# opensubtitles.org, opensubtitles.com, subdl.com, subdl.org, piratelk.com).
+# [vars]
+# ALLOWED_SUB_HOSTS = "mysubtitles.example,mirror.example"
+
+# Optional R2 (not required; KV/Cache alone handles the 24h-TTL subtitle blobs):
+# [[r2_buckets]]
+# binding = "SUBS_R2"
+# bucket_name = "anantplay-si-subs"
