@@ -7,10 +7,15 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   test:
-    name: tests + wrangler dry-run
+    name: tests + secret scan + wrangler dry-run
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
 
@@ -23,42 +28,59 @@ jobs:
         with:
           python-version: '3.12'
 
-      # package-lock.json is committed, so `npm ci` is reproducible (wrangler is a pinned
-      # devDependency — no floating npx download).
+      # package-lock.json is committed and version-synced with package.json, so `npm ci`
+      # is reproducible (wrangler is a pinned devDependency — no floating npx download).
       - name: Install (locked)
         run: npm ci --no-audit --no-fund
 
-      - name: Syntax gates
+      # Gate 1 — no raw Google API key literal may ever be tracked (the translate-pa
+      # key is env-only: TRANSLATE_PA_KEY or TRANSLATE_PA_KEY_HEAD/TAIL vars).
+      - name: Secret scan — zero AIza… literals
+        run: |
+          if grep -rInE 'AIza[0-9A-Za-z_-]{20,}' \
+               --exclude-dir=node_modules --exclude-dir=.git --exclude-dir=.wrangler . ; then
+            echo "::error title=secret-leak::a raw AIza… key literal is tracked in the repo"
+            exit 1
+          fi
+          echo "OK — zero AIza… literals in tracked files"
+
+      # Gate 1 — no deploy archives tracked; the synthetic fixtures stay.
+      - name: No uploaded .zip archives
+        run: |
+          extra=$(git ls-files '*.zip' | grep -v '^tests/fixtures/' || true)
+          if [ -n "$extra" ]; then
+            echo "::error title=archive-left::unexpected tracked archives: $extra"
+            exit 1
+          fi
+          test -f tests/fixtures/pack.zip || { echo "::error title=fixture-missing::tests/fixtures/pack.zip is required by the extraction tests"; exit 1; }
+
+      - name: Syntax gates (every worker module, UI, labs, local server)
         run: |
           node --check worker/src/lib.js
+          node --check worker/src/languages.js
+          node --check worker/src/cinema.js
           node --check worker/src/pipeline.js
+          node --check worker/src/providers.js
           node --check worker/src/index.js
           node --check bridge-ui/public/app.js
           node --check lab/verify_worker_e2e.mjs
+          node --check lab/verify_worker_v4_e2e.mjs
+          node --check lab/verify_worker_v41_e2e.mjs
+          node --check tests/run-all.js
           python3 -m py_compile local-server/server.py
 
-      - name: Worker tests (real .srt 200, catalogs, gz/zip, dedupe)
-        run: node tests/worker.test.js
-
-      - name: Fixture tests (shipped synthetic Sinhala fixtures)
-        run: node tests/fixtures.test.js
-
-      - name: Pipeline v3 tests (resolve, human subs, Gemini job, paired cues, 202)
-        run: node tests/pipeline.test.js
-
-      - name: Security regression tests (SSRF, zip-bomb, XSS surface, payload caps)
-        run: node tests/security.test.js
-
-      - name: Unified runner (every *.test.js, zero skipped)
+      # The single source of truth: every *.test.js (worker, fixtures, pipeline,
+      # providers, security, v41) — 235+ checks, zero skipped.
+      - name: Offline test suite (node tests/run-all.js)
         run: node tests/run-all.js
 
       - name: Real-HTTP local server end-to-end tests
         run: python3 -m unittest discover -s tests -p 'local_server_test.py' -v
 
       # No Cloudflare credentials are needed: --dry-run only builds the bundle, validates
-      # wrangler.toml ([assets] + optional KV) and exits before any API call. On failure the
+      # wrangler.toml ([assets] + SUBS_KV) and exits before any API call. On failure the
       # captured output is surfaced as a check annotation so the real error is visible.
-      - name: Wrangler deploy dry-run (no secrets)
+      - name: Wrangler deploy dry-run (pinned binary, no secrets)
         env:
           WRANGLER_SEND_METRICS: 'false'
         run: |
@@ -70,3 +92,33 @@ jobs:
             echo "::error title=wrangler-dry-run-failed::$(tail -c 2500 wrangler-dry-run.log | tr '\n' '|')"
             exit "$rc"
           fi
+
+  live-labs:
+    name: live workerd labs (v4 + v4.1)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+
+      - name: Install (locked)
+        run: npm ci --no-audit --no-fund
+
+      # Both labs are offline-safe: they boot the REAL workerd via `wrangler dev`
+      # (local mode + simulated KV) and point every provider at a loopback mock, so
+      # they need no keys and no outbound provider traffic.
+      - name: v4 zero-429 lab (27 assertions)
+        env:
+          CI: 'true'
+          WRANGLER_SEND_METRICS: 'false'
+        run: node lab/verify_worker_v4_e2e.mjs
+
+      - name: v4.1 multi-language + translate-pa + two-stage lab (35 assertions)
+        env:
+          CI: 'true'
+          WRANGLER_SEND_METRICS: 'false'
+        run: node lab/verify_worker_v41_e2e.mjs

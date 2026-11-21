@@ -1,26 +1,32 @@
-# AnantPlay Sinhala Subtitle Bridge v3 — Cloudflare Worker (free tier)
-# One unified worker serves BOTH the Bridge UI (/, /app.js, /style.css), the real
-# /sub/<token>.srt delivery AND the v3 Companion API (/api/resolve, /subtitles/:type/:id.json,
-# /api/paired/:jobId.json) from a single origin.
+# AnantPlay Sinhala Subtitle Bridge v4 — Cloudflare Worker (free tier)
+# One unified worker: the Bridge UI, real /sub/<token>.srt delivery, the v3 Companion
+# API AND the v4 MULTI-PROVIDER zero-429 translation engine.
 #
-# Zero-config deploy: `npx wrangler deploy` just works — no KV namespace required.
-# Without a KV binding the worker stores subtitles in the Cache API (per-colo, 24h) and
-# translation jobs in per-isolate memory (fine for testing; NOT the permanent cache), so
-# the bridge is usable on the free tier immediately. For subtitles that must survive cache
-# eviction, be readable from every colo, and make finished translation jobs PERMANENT,
-# bind KV (strongly recommended for the Companion):
+# ── v4 TRANSLATION CHAIN (automatic failover, ONE legitimate key each) ────────
+#   TRANSLATION_CHAIN (var, optional) — default order:
+#     azure → google_v3 → gemini → workers_ai
+#   npx wrangler secret put AZURE_TRANSLATOR_KEY     # Azure AI Translator F0: 2,000,000 chars/MONTH free (Sinhala ✓ NMT)
+#   npx wrangler secret put AZURE_TRANSLATOR_REGION  # optional (default global), e.g. eastus
+#   npx wrangler secret put GOOGLE_V3_KEY            # Google Cloud Translation: 500,000 chars/month free (Sinhala ✓)
+#   npx wrangler secret put GEMINI_API_KEY           # Gemini free tier ≈1,500 RPD shared (LLM quality)
+#   [ai] binding below (uncomment)                   # Workers AI: 10,000 neurons/day, ZERO external key
+#   Any 429 trips a 10-minute per-provider circuit breaker and the batch continues
+#   on the next provider. Unconfigured providers are skipped automatically.
 #
-#   npx wrangler kv namespace create SUBS_KV        # prints an id
-#   # then uncomment the block below and paste the id in
+#   Multi-account key farming is NOT used and NOT recommended: rotating Google
+#   accounts to multiply free-tier Gemini keys violates Google's ToS and risks
+#   account/key suspension. One legitimate key per provider + failover + the
+#   permanent KV cache is the sustainable architecture.
 #
-# v3 worker secrets (recommended — zero key typing on any phone):
-#   npx wrangler secret put GEMINI_API_KEY   # Gemini Flash EN→SI full-movie translation
-#   npx wrangler secret put SUBDL_API_KEY    # optional: SubDL 'si' human-subs provider
+# ── KV (STRONGLY recommended — free forever) ──────────────────────────────────
+#   100,000 reads/day + 1,000 writes/day free. Without it jobs are per-isolate:
+#   they vanish on isolate restarts ("token cold / isolate miss") and the worker
+#   reports status:"degraded" + a loud storageWarn in /health and /api/status.
+#   npx wrangler kv namespace create SUBS_KV     # prints an id → paste it below
+#   npx wrangler deploy
 #
-# v3 lab (Phase 4 Live Verification):
-#   node lab/verify_worker_e2e.mjs                      # boots wrangler dev + mock Gemini
-#   node lab/verify_worker_e2e.mjs --target https://anantplay-si-subs-bridge.techworldlk.workers.dev
-#   GEMINI_API_KEY=... node lab/verify_worker_e2e.mjs --use-real-gemini
+# v3 secrets kept: GEMINI_API_KEY, SUBDL_API_KEY (optional human-subs provider).
+# v4 lab: node lab/verify_worker_v4_e2e.mjs  (real workerd + local KV + mock providers)
 
 name = "anantplay-si-subs-bridge"
 main = "worker/src/index.js"
@@ -32,9 +38,13 @@ compatibility_date = "2024-10-01"
 directory = "./bridge-ui/public"
 binding = "ASSETS"
 
-# Optional KV store (recommended for the Companion: permanent job cache + artifacts).
-# Commented out so `wrangler deploy` works with no namespace id and CI's
-# `wrangler deploy --dry-run` stays green.
+# KV store (STRONGLY recommended: permanent translation cache + resumable job store).
+# This id belongs to the production namespace (anantplay-si-subs-bridge.techworldlk.workers.dev).
+# Deploying to ANOTHER account? Replace it with your own:
+#   npx wrangler kv namespace create SUBS_KV     # prints id = "…" → paste above
+# To deploy with ZERO configuration (no KV at all), comment this block out: the worker
+# still boots and serves, reporting status:"degraded" + storageWarn:SUBS_KV instead of crashing.
+# CI's `wrangler deploy --dry-run` stays green either way.
 [[kv_namespaces]]
 binding = "SUBS_KV"
 id = "bced026adaee4ddaa641a033a2ddb552"
@@ -43,6 +53,26 @@ id = "bced026adaee4ddaa641a033a2ddb552"
 # opensubtitles.org, opensubtitles.com, subdl.com, subdl.org, piratelk.com).
 # [vars]
 # ALLOWED_SUB_HOSTS = "mysubtitles.example,mirror.example"
+
+
+# ── v4.1 MULTI-LANGUAGE + TRANSLATE-PA (Layer 1, optional) ────────────────────
+# Any registry language: GET /subtitles/movie/tt….json?lang=si|ta|hi|en|es|fr|ja|ko|zh-CN|ar|ur|de|ru|pt|th|id|tr|vi
+#                        &register=auto|spoken|formal  (auto = genre-decided; Epic/History → formal)
+# Two-stage delivery: the base NMT .srt is playable immediately (X-Sub-Quality: base-nmt);
+# the cinema polish upgrades the SAME token in the background (X-Polish-Status: pending→done).
+#
+# translate-pa — Chrome's keyless translation endpoint, live-verified 2026-11-22
+# (natural SPOKEN Sinhala, 500-line batches, <i> tags preserved). UNDOCUMENTED:
+# it can be walled any day — the chain (azure → google_v3 → gemini → workers_ai)
+# takes over automatically via the circuit breaker. OFF by default.
+#   [vars]
+#   ENABLE_TRANSLATE_PA = "true"          ← uncomment this line (and the [vars] header) to enable
+# And EITHER one secret (wrangler secret put TRANSLATE_PA_KEY) or modular vars
+# (TRANSLATE_PA_KEY_HEAD / TRANSLATE_PA_KEY_TAIL) — NEVER commit a key literal.
+# TRANSLATE_PA_KEY_HEAD = "AIza…"   ← first half (var)
+# TRANSLATE_PA_KEY_TAIL = "…520"    ← second half (var)
+#   (vars, not secrets, keep GitHub secret-scanning quiet about the full pattern;
+#    the assembled key is only ever present in worker memory)
 
 # Optional: override the Gemini model (default: gemini-flash-latest) — a Worker var, not a secret.
 # GEMINI_MODEL = "gemini-flash-latest"

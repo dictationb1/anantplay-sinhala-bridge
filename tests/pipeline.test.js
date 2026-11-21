@@ -208,9 +208,9 @@ const ORIGIN = 'https://bridge.example';
   const env = { SUBS_KV: kv, GEMINI_API_KEY: 'test-key', GEMINI_API_BASE: GEMINI_MOCK_BASE };
   const res = await handleRequest(new Request(ORIGIN + '/subtitles/movie/tt34890576.json?title=Clayface'), env, ctx);
   const j = JSON.parse(await res.text());
-  check('clayface: starts translating job', res.status === 200 && j.status === 'translating' && j.source === 'gemini', JSON.stringify(j).slice(0, 160));
+  check('clayface: starts translating job', res.status === 200 && j.status === 'translating' && j.source === 'ai' && typeof j.provider === 'string', JSON.stringify(j).slice(0, 160));
   check('clayface: deterministic si url present while translating', /^\/sub\/[0-9a-f]{16}\.srt$/.test(j.si.url.replace(ORIGIN, '')), j.si.url);
-  check('clayface: 4 batches of 100 cues', j.total === 4 && j.done === 0, JSON.stringify({ total: j.total, done: j.done }));
+  check('clayface: 3 compact batches of 100 cues (v4 pacing)', j.total === 3 && j.done === 0, JSON.stringify({ total: j.total, done: j.done }));
 
   // the 202 progress contract on the deterministic URL while translating
   const mid = await handleRequest(new Request(j.si.url), env);
@@ -263,7 +263,7 @@ const ORIGIN = 'https://bridge.example';
   check('clayface: cached done job triggers no new upstream/gemini calls', m.spy.os === callsOs && m.spy.gemini === callsGem, m.spy.os + '/' + m.spy.gemini);
 
   // gemini was called 4 times (one per batch), concurrency respected
-  check('clayface: exactly one gemini call per batch (4)', m.spy.gemini === 4, m.spy.gemini);
+  check('clayface: exactly one gemini call per batch (3 — v4 compact pacing)', m.spy.gemini === 3, m.spy.gemini);
   m.restore();
 }
 
@@ -313,7 +313,7 @@ const ORIGIN = 'https://bridge.example';
   check('health: ok', health.status === 200 && (await health.json()).ok === true);
   const status = await handleRequest(new Request(ORIGIN + '/api/status'), { GEMINI_API_KEY: 'x' });
   const st = JSON.parse(await status.text());
-  check('status: reports secrets as booleans (never values)', status.status === 200 && st.secrets.gemini === true && st.secrets.subdl === false && st.model === 'gemini-flash-latest', JSON.stringify(st).slice(0, 140));
+  check('status: reports secrets as booleans (never values)', status.status === 200 && st.secrets.gemini === true && st.secrets.subdl === false && Array.isArray(st.translationChain) && st.translationChain.includes('gemini'), JSON.stringify(st).slice(0, 140));
 }
 
 // ── 8. series episode path (S01E02 job key) ─────────────────────────────────

@@ -1,4 +1,4 @@
-# SETUP (EN) — AnantPlay Sinhala Subtitle Bridge v2.1
+# SETUP (EN) — AnantPlay Subtitle Bridge v4.1 (multi-language) & LAN v2.1
 
 Two hosting modes; pick ONE. Both serve the **same real HTTP 200 `.srt` URLs** that fix the v1
 404-on-ExoPlayer bug. No fork of AnantPlay is required for any of this — the app is used exactly
@@ -33,6 +33,46 @@ Uncomment the `[[kv_namespaces]]` block in `wrangler.toml`, paste the id, and `n
 again. The worker never crashes when `SUBS_KV` is missing; it just uses the cache instead.
 
 Your bridge is live at `https://anantplay-si-subs-bridge.<your-subdomain>.workers.dev/`.
+
+### 2b · v4.1 — 18 languages, two-stage cinema polish, provider failover
+
+**Bind KV first** — it is the permanent translation cache and the resumable polish store:
+
+```bash
+npx wrangler kv namespace create SUBS_KV   # prints id = "…"
+# paste the id into wrangler.toml → [[kv_namespaces]] binding = "SUBS_KV"
+```
+
+**Add ONE legitimate key per provider** (unconfigured providers are skipped automatically):
+
+```bash
+npx wrangler secret put AZURE_TRANSLATOR_KEY     # Azure AI Translator F0: 2M chars/month free
+npx wrangler secret put AZURE_TRANSLATOR_REGION  # optional, default global
+npx wrangler secret put GOOGLE_V3_KEY            # Google Cloud Translation: 500k chars/month free
+npx wrangler secret put GEMINI_API_KEY           # Gemini free tier (the cinema-polish LLM)
+npx wrangler secret put SUBDL_API_KEY            # optional human-subs provider
+npx wrangler deploy
+```
+
+**Optional translate-pa accelerator — OFF by default** (an undocumented Google endpoint; when it
+is walled the chain fails over automatically through its 10-minute circuit breaker):
+
+```bash
+npx wrangler secret put TRANSLATE_PA_KEY   # or TRANSLATE_PA_KEY_HEAD / TRANSLATE_PA_KEY_TAIL vars
+# wrangler.toml → [vars] ENABLE_TRANSLATE_PA = "true"   then: npx wrangler deploy
+```
+
+**Use another language**: every endpoint takes `?lang=` (any of `si ta hi en es fr ja ko zh-CN ar ur
+de ru pt th id tr vi`) and `?register=auto|spoken|formal` (`auto` decides from the genre —
+Epic/History/War → formal). `si` keeps the bare v4 job ids, so existing installs are unaffected.
+
+**Two-stage delivery**: the base NMT `.srt` is playable immediately (`X-Sub-Quality: base-nmt`,
+`X-Polish-Status: pending`); the cinema polish then upgrades the SAME `/sub/<token>.srt` in place
+(`X-Polish-Status: done`). A failed polish never breaks the published base file — it stays
+`base-nmt` with `polishStatus: failed` and the player keeps working.
+
+**No KV bound?** Nothing crashes: `/health` reports `status: "degraded"` and `/api/status` returns a
+loud `storageWarn` telling you the exact `wrangler kv namespace create SUBS_KV` fix.
 
 ### 3 · Verify (30 seconds)
 ```bash
@@ -147,6 +187,9 @@ They are OPTIONAL: the Bridge works with the released APK as-is.
 
 | Symptom | Fix |
 | --- | --- |
+| `/health` says `status: "degraded"` | `SUBS_KV` is not bound — `/api/status` carries the exact fix in `storageWarn`. Run `npx wrangler kv namespace create SUBS_KV`, paste the id into `wrangler.toml`, redeploy. |
+| `/sub/…` header says `X-Polish-Status: pending` / `failed` | The base NMT subtitle is fine and playable; only the cinema polish is waiting (it is resumable) or the LLM key is missing/quota-limited. Check `GEMINI_API_KEY` (or the `[ai]` Workers AI binding). |
+| A language returns the `si` job | `?lang=` must be one of the 18 registry codes (e.g. `zh-CN`, not `zh`); unknown codes intentionally fall back to Sinhala/v4 behaviour. |
 | `/api/*` returns "no storage" | Either bind KV (`npx wrangler kv namespace create SUBS_KV`) or deploy to a zone where the Cache API is available. A `workers.dev` deploy has the cache, so this only appears in exotic setups. |
 | Subtitles don't attach | Tap **URL එක fetch කරන්න** on the Bridge so the Sniffer sees the real request BEFORE handing off the stream |
 | "upstream host not allowlisted" | The source is not one of the supported providers; download the `.srt` and use Upload instead, or add the host via `ALLOWED_SUB_HOSTS` |

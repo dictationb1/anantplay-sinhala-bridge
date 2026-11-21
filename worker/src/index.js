@@ -1,32 +1,36 @@
-/* AnantPlay Sinhala Subtitle Bridge — Cloudflare Worker v3 (zero-fork edition).
+/* AnantPlay Sinhala Subtitle Bridge — Cloudflare Worker v4 (zero-fork edition).
  *
- * ── v3 (this upgrade) — the standalone Companion API ──────────────────────────
+ * ── v4 (this upgrade) — multi-provider zero-429 engine ────────────────────────
  *   GET /api/resolve?title=Clayface[&type=movie|series][&season=&episode=]
  *        → IMDb id + clean title/year via Cinemeta (same service official AnantPlay uses).
  *   GET /subtitles/:type/:id.json[?season=&episode=&title=&fresh=1]
- *        → human Sinhala first (OpenSubtitles sin / SubDL si), else a Gemini Flash
- *          EN→SI full-movie batch-translation job (worker secret GEMINI_API_KEY).
+ *        → human Sinhala first (OpenSubtitles sin / SubDL si), else a multi-provider
+ *          AI translation job: azure → google_v3 → gemini → workers_ai, automatic
+ *          429 failover + KV circuit breakers + single-flight job locks.
+ *   POST /api/subs-direct  {srt: "<full English .srt text>", name?}
+ *        → NEW v4: translate a cast-supplied English subtitle directly (AnantPlay's
+ *          own `subs` extra / a side-loaded file). Same deterministic cache: the
+ *          same text is translated once, forever.
  *   GET /api/paired/:jobId.json
- *        → compact {i,t0,t1,en,enf,si} cue array — the Companion's <10 ms cue-lock data.
+ *        → compact {i,t0,t1,en,enf,si} cue array — the Player's <10 ms cue-lock data.
  *   GET /sub/<token>.srt — real HTTP 200 UTF-8 SRT; 202 {status,progress,eta_sec}
  *        while a job's Sinhala file is still translating (deterministic token).
- *   GET /api/status — storage mode + which worker secrets are configured (booleans only).
- *   GET /health — liveness probe.
+ *   GET /api/status — storage mode + which provider secrets are configured
+ *        (booleans only) + a LOUD warning when KV is missing.
+ *   GET /health — liveness + storage warning (the app's Self-Test surfaces it).
  *
- * ── kept from v2.1 (Arena PR #1 security hardening, all tests preserved) ──────
- *   BUG #1 FIX: real HTTP 200 .srt URLs (/sub/<token>.srt) so ExoPlayer's
- *   DefaultDataSource — running OUTSIDE the WebView — fetches a real file, and the
- *   WebView sees the genuine network request so Sniffer captures it as a subtitle.
- *   BUG #2 FIX: /api/search and /api/fetch-sub run server-side (real User-Agent),
- *   gunzip .gz and unzip .zip (best .srt entry, __MACOSX/ skipped, .. traversal
- *   rejected), convert to BOM-less UTF-8 and publish at a real /sub/<token>.srt URL.
- *   v2.1 SECURITY: strict subtitle-provider allowlist re-validated on every redirect
- *   hop; credentials/ports/IP-literals/private hosts rejected; 5 MB upstream and
- *   decompression caps (zip/gzip-bomb guard); 2 MB publish cap; strict token format.
+ * ── kept from v2.1/v3 (all tests preserved) ──────────────────────────────────
+ *   Real HTTP 200 .srt URLs (/sub/<token>.srt); /api/search + /api/fetch-sub
+ *   server-side with real User-Agent, gunzip/unzip (zip-bomb guard, __MACOSX/
+ *   skipped, .. traversal rejected), BOM-less UTF-8 publish; strict subtitle-
+ *   provider allowlist re-validated on every redirect hop; credentials/ports/
+ *   IP-literals/private hosts rejected; 5 MB upstream + decompression caps.
  *
- * Storage: KV when bound (recommended — permanent job cache + artifacts). Without
- * KV the worker degrades to the Cache API (+ per-isolate job Map) so a zero-config
- * deploy still works.
+ * Storage: KV when bound (STRONGLY recommended: 100,000 reads + 1,000 writes
+ * per day free forever — the permanent translation cache + job resume store).
+ * Without KV the worker degrades to the Cache API + per-isolate Map and says
+ * so LOUDLY in /health and /api/status (storageWarn) — jobs vanish on isolate
+ * restarts and that must never be a mystery again.
  */
 
 import {
@@ -41,10 +45,31 @@ import {
 import {
   PIPELINE_VERSION, JOB_ID_RE, jobIdOf,
   cinemetaResolve, cinemetaMeta, flattenLikeAnantPlay, parseTsMs, buildPairedCues,
-  geminiKeyOf, geminiModelOf, geminiBaseOf, geminiTranslateBatch, translateBatchRobust,
   makeBatches, ensureSubtitleJob, resumeTranslationJob, getPaired, jobForToken,
-  getJob, kvGet, kvPut, deterministicToken,
+  translateDirectSub, translateBatchRobust as pipelineTranslateBatchRobust,
+  getJob, kvGet, kvPut, deterministicToken, acquireLock,
 } from './pipeline.js';
+import { LANGUAGES, CHIP_LANGS, DEFAULT_LANG } from './languages.js';
+
+import { chainOf, providerStatus, DEFAULT_CHAIN, geminiTranslateCues, paConfigured } from './providers.js';
+
+/** v3 API compat shim: the old tests call geminiTranslateBatch(env, key, model, items).
+ *  v4 routes the same call through the provider with the key injected into env. */
+async function geminiTranslateBatch(env, key, model, items) {
+  const env2 = { ...env, GEMINI_API_KEY: key };
+  return geminiTranslateCues(env2, { model: model || undefined }, items);
+}
+
+/** v3 API compat shim: translateBatchRobust(env, key, model, items) → v4
+ *  (env, items, cfg). Detects the legacy form by its string second argument.
+ *  The legacy callers expect a String[] (v4 returns {texts, provider}). */
+async function translateBatchRobust(env, a, b, c) {
+  if (typeof a === 'string' && Array.isArray(c)) {
+    const r = await pipelineTranslateBatchRobust({ ...env, GEMINI_API_KEY: a }, c, { model: b || undefined });
+    return r.texts;
+  }
+  return pipelineTranslateBatchRobust(env, a, b);
+}
 
 export {
   // lib (v2.1 exports kept — every existing test keeps passing unchanged)
@@ -53,20 +78,23 @@ export {
   getSrt, hasStorage, isValidToken, openSubsSearch, stremioOsSearch, subdlSearch, pirateLkSearch,
   fetchUpstreamSub, assertSafeUpstreamUrl, isPrivateHost, hostAllowed, safeFetchBytes,
   readStreamCapped, limits, catalogRoutes,
-  // v3 pipeline (functions only — workerd rejects exported constants)
+  // v4 pipeline (functions only — workerd rejects exported constants)
   cinemetaResolve, cinemetaMeta, flattenLikeAnantPlay, parseTsMs, buildPairedCues,
-  geminiKeyOf, geminiModelOf, geminiBaseOf, geminiTranslateBatch, translateBatchRobust,
   makeBatches, ensureSubtitleJob, resumeTranslationJob, getPaired, jobForToken,
-  getJob, kvGet, kvPut, deterministicToken, jobIdOf, handleRequest,
+  translateDirectSub, getJob, kvGet, kvPut, deterministicToken, jobIdOf, handleRequest,
+  acquireLock, providerStatus, chainOf, geminiTranslateCues, geminiTranslateBatch,
+  translateBatchRobust,
 };
 
+/** The storage warning string — the SAME text in /health and /api/status so the
+ *  app's Self-Test and the user's browser both see it. Empty when KV is bound. */
+function storageWarn(env) {
+  if (env && env.SUBS_KV) return '';
+  return '⚠ storage=cache+memory: SUBS_KV is NOT bound. Translation jobs live only inside one isolate — they VANISH on restart (token cold / isolate miss) and finished subs are per-colo 24h only. Fix (free forever): npx wrangler kv namespace create SUBS_KV → paste the id into wrangler.toml [[kv_namespaces]] → npx wrangler deploy';
+}
+
 /** The dynamic index/sites/deeplinks JSONs — generated from the LIVE host, so there is
- * never a placeholder YOUR-HOST to forget. Shapes verified against AnantPlay v2.23.1:
- *  - Sources.parseIndex: {"sources":[{id,name,type,url}]} types sites|playlist|deeplinks
- *  - Sites.parse: {"rows":{movies,tv,sports,anime,live,more:[{name,url,index(bool),...}]},
- *                 "languages":{"<Lang>":[Site,...]}}   (Cats.KEYS, Sites.java:129-150)
- *  - deeplinks: {"<hostname>":{movie,tv,episode,anime}} keyed by Sites.hostOf() (no www.)
- */
+ * never a placeholder YOUR-HOST to forget. Shapes verified against AnantPlay v2.23.1. */
 function catalogRoutes(url) {
   const origin = url.origin;
   const host = String(url.hostname || '').replace(/^www\./, '');
@@ -108,6 +136,11 @@ function subtitleJobBody(origin, job) {
   const base = {
     ok: true, jobId: job.id, type: job.type, imdb: job.imdb, season: job.season, episode: job.episode,
     status: job.status, source: job.source || null, cues: job.cues || 0,
+    provider: job.provider || null,
+    // v4.1: the target language + two-stage delivery state
+    lang: job.lang || 'si',
+    quality: job.quality || (job.status === 'done' ? (job.source === 'human' ? 'human' : 'base-nmt') : null),
+    polishStatus: job.polishStatus || (job.status === 'done' ? 'off' : null),
   };
   if (job.status === 'done') {
     base.si = { url: origin + '/sub/' + job.siToken + '.srt', token: job.siToken, lang: 'sin' };
@@ -149,26 +182,49 @@ async function handleRequest(request, env, ctx) {
         'Access-Control-Allow-Origin': '*',
         'Access-Control-Allow-Methods': 'GET,POST,OPTIONS',
         'Access-Control-Allow-Headers': 'Content-Type, X-SubDL-Key, X-Gemini-Key, X-Gemini-Model',
+        'Access-Control-Expose-Headers': 'X-Sub-Quality, X-Polish-Status, X-Sub-Lang',
         'Access-Control-Max-Age': '86400',
       },
     });
   }
 
-  // ── liveness + status ──
+  // ── liveness + status (v4: the loud KV warning lives in BOTH) ──
   if (p === '/health' && (request.method === 'GET' || request.method === 'HEAD')) {
-    return json({ ok: true, status: 'ok', version: PIPELINE_VERSION });
+    const warn = storageWarn(env);
+    return json({
+      ok: true, status: warn ? 'degraded' : 'ok', version: PIPELINE_VERSION,
+      storage: env && env.SUBS_KV ? 'kv' : 'cache+memory',
+      storageWarn: warn || undefined,
+      providers: providerStatus(env),
+      // v4.1: multi-language engine state
+      languages: { count: Object.keys(LANGUAGES).length, default: 'si', chips: CHIP_LANGS },
+      chainSi: chainOf(env, 'si'),
+      chainTa: chainOf(env, 'ta'),
+      translatePa: paConfigured(env) ? 'enabled' : 'off',
+    });
   }
   if (p === '/api/status' && request.method === 'GET') {
     const l = limits();
+    const warn = storageWarn(env);
     return json({
       ok: true, version: PIPELINE_VERSION,
       storage: env && env.SUBS_KV ? 'kv' : 'cache+memory',
+      storageWarn: warn || undefined,
       secrets: {
-        gemini: geminiKeyOf(env, request.headers) !== '' || !!(env && env.GEMINI_API_KEY),
+        azure: !!(env && env.AZURE_TRANSLATOR_KEY),
+        google_v3: !!(env && env.GOOGLE_V3_KEY),
+        gemini: !!(env && env.GEMINI_API_KEY),
         subdl: !!(env && env.SUBDL_API_KEY),
+        workers_ai: !!(env && env.AI),
       },
-      model: geminiModelOf(env, request.headers),
+      providers: providerStatus(env),
+      translationChain: chainOf(env, 'si'),
+      defaultChain: DEFAULT_CHAIN,
       limits: l,
+      // v4.1: the registry + the per-language chains the player's picker uses
+      languages: Object.keys(LANGUAGES).map((c) => ({ code: c, ...LANGUAGES[c] })),
+      chainsByLang: Object.fromEntries(CHIP_LANGS.concat(['hi', 'zh-CN', 'ur']).map((c) => [c, chainOf(env, c)])),
+      translatePa: { enabled: paConfigured(env), note: paConfigured(env) ? 'Layer-1 keyless NMT (failover-protected)' : 'set ENABLE_TRANSLATE_PA=true + TRANSLATE_PA_KEY to activate' },
       companion: { defaultWorkerUrl: 'https://anantplay-si-subs-bridge.techworldlk.workers.dev' },
     });
   }
@@ -188,39 +244,51 @@ async function handleRequest(request, env, ctx) {
       if (job && job.status === 'translating') {
         const done = job.done || 0, total = job.total || 1;
         const eta = job.startedAt && done > 0 ? Math.max(1, Math.round(((Date.now() - job.startedAt) / done) * (total - done) / 1000)) : null;
-        return json({ status: 'translating', progress: +(done / total).toFixed(3), done, total, eta_sec: eta }, 202);
+        return json({ status: 'translating', progress: +(done / total).toFixed(3), done, total, eta_sec: eta, provider: job.provider || null }, 202);
       }
       if (job && job.status === 'error') {
         return json({ status: 'error', error: job.error || 'job failed' }, 410);
       }
       return new Response('subtitle expired or not found\n', { status: 404, headers: { 'Content-Type': 'text/plain; charset=utf-8', 'Access-Control-Allow-Origin': '*' } });
     }
-    if (request.method === 'HEAD') return new Response(null, { status: 200, headers: SRT_HEADERS });
-    return new Response(text, { status: 200, headers: SRT_HEADERS });
+    {
+      // v4.1 two-stage headers: the player hot-swaps when quality flips to
+      // cinema-polished (X-Polish-Status: pending → done)
+      const job = await jobForToken(env, subMatch[1]).catch(() => null);
+      const h = { ...SRT_HEADERS };
+      if (job) {
+        h['X-Sub-Quality'] = String(job.quality || (job.status === 'done' && job.source === 'human' ? 'human' : 'base-nmt'));
+        h['X-Polish-Status'] = String(job.polishStatus || (job.status === 'done' ? 'off' : 'pending'));
+        h['X-Sub-Lang'] = String(job.lang || 'si');
+        h['Access-Control-Expose-Headers'] = 'X-Sub-Quality, X-Polish-Status, X-Sub-Lang';
+      }
+      if (request.method === 'HEAD') return new Response(null, { status: 200, headers: h });
+      return new Response(text, { status: 200, headers: h });
+    }
   }
 
   // ── dynamic catalog JSONs (live-host generated) ──
   const cat = catalogRoutes(url);
   if (cat[p] && (request.method === 'GET' || request.method === 'HEAD')) return json(cat[p]);
 
-  // ── v3: Cinemeta resolve (title → IMDb; the Companion's zero-typing path) ──
+  // ── Cinemeta resolve (title → IMDb; the Player's zero-typing path) ──
   if (p === '/api/resolve' && request.method === 'GET') {
     const imdbIn = String(url.searchParams.get('imdb') || '').trim();
     const type = url.searchParams.get('type') === 'series' ? 'series' : 'movie';
     const season = Math.max(0, Math.min(999, Number(url.searchParams.get('season') || 0) || 0));
     const episode = Math.max(0, Math.min(9999, Number(url.searchParams.get('episode') || 0) || 0));
     if (/^tt\d{4,10}$/.test(imdbIn)) {
-      const meta = await cinemetaMeta(type, imdbIn).catch(() => ({ imdb: imdbIn, name: imdbIn, year: '' }));
+      const meta = await cinemetaMeta(type, imdbIn, env).catch(() => ({ imdb: imdbIn, name: imdbIn, year: '' }));
       return json({ ok: true, type, imdb: imdbIn, name: meta.name, year: meta.year, season, episode });
     }
     const title = String(url.searchParams.get('title') || '').trim();
     if (title.length < 2) return json({ ok: false, error: 'give ?title=… (min 2 chars) or ?imdb=tt…' }, 400);
-    const hit = await cinemetaResolve(title, type).catch(() => null);
+    const hit = await cinemetaResolve(title, type, env).catch(() => null);
     if (!hit) return json({ ok: false, error: 'no Cinemeta match for: ' + title.slice(0, 80) }, 404);
     return json({ ok: true, type, imdb: hit.imdb, name: hit.name, year: hit.year, season, episode });
   }
 
-  // ── v3: the Companion's main endpoint (Stremio-addon shaped) ──
+  // ── the Player's main endpoint (Stremio-addon shaped) ──
   const subsMatch = /^\/subtitles\/(movie|series)\/(tt\d{4,10})(?:\.json)?$/.exec(p);
   if (subsMatch && request.method === 'GET') {
     const r = await ensureSubtitleJob(env, ctx, {
@@ -231,6 +299,8 @@ async function handleRequest(request, env, ctx) {
       title: url.searchParams.get('title') || '',
       fresh: url.searchParams.get('fresh') === '1',
       subdlKey: request.headers.get('X-SubDL-Key') || '',
+      lang: url.searchParams.get('lang') || 'si',          // v4.1: any registry language
+      register: url.searchParams.get('register') || 'auto', // v4.1: auto|spoken|formal
       headers: request.headers,
     });
     if (r.badRequest) return json({ ok: false, error: r.badRequest }, 400);
@@ -240,8 +310,30 @@ async function handleRequest(request, env, ctx) {
     return json(subtitleJobBody(url.origin, r.job));
   }
 
-  // ── v3: the <10 ms cue-lock payload ──
-  const pairedMatch = /^\/api\/paired\/((?:movie|series):tt\d{4,10}:\d{1,4}:\d{1,5})(?:\.json)?$/.exec(p);
+  // ── NEW v4: translate a cast-supplied English .srt directly ──
+  // The AnantPlay cast payload already carries `subs` URLs (and the stream may
+  // hold its own text track). The player POSTs that text here; the worker
+  // translates it through the same failover chain + permanent cache.
+  if (p === '/api/subs-direct' && request.method === 'POST') {
+    let body;
+    try { body = await request.json(); } catch (e) { return json({ ok: false, error: 'bad json' }, 400); }
+    const srt = String(body && body.srt || '');
+    if (!srt) return json({ ok: false, error: 'missing "srt" (the full English .srt text)' }, 400);
+    if (srt.length > MAX_PUBLISH_BYTES) return json({ ok: false, error: 'srt too large (2 MB max)' }, 413);
+    const r = await translateDirectSub(env, ctx, srt, {
+      name: String(body.name || '').slice(0, 200),
+      fresh: body.fresh === true,
+      lang: String(body.lang || 'si'),
+      register: String(body.register || 'auto'),
+    });
+    if (r.badRequest) return json({ ok: false, error: r.badRequest }, 400);
+    if (r.needsKey) return json({ ok: false, status: 'needs-key', error: r.needsKey, subtitles: [] });
+    if (r.started && ctx && typeof ctx.waitUntil === 'function') ctx.waitUntil(r.started);
+    return json(subtitleJobBody(url.origin, r.job));
+  }
+
+  // ── the <10 ms cue-lock payload ──
+  const pairedMatch = /^\/api\/paired\/((?:movie|series):tt\d{4,10}:\d{1,4}:\d{1,5}(?::[a-z]{2}(?:-CN)?)?|direct:[0-9a-f]{16}(?::[a-z]{2}(?:-CN)?)?)(?:\.json)?$/.exec(p);
   if (pairedMatch && request.method === 'GET') {
     const jobId = pairedMatch[1];
     if (!JOB_ID_RE.test(jobId)) return json({ ok: false, error: 'bad job id' }, 400);
@@ -250,7 +342,7 @@ async function handleRequest(request, env, ctx) {
     return json(r.body, r.status);
   }
 
-  // ── API: search (BUG #2 fix — server-side User-Agent) ──
+  // ── API: search (server-side User-Agent) ──
   if (p === '/api/search' && request.method === 'GET') {
     const imdb = url.searchParams.get('imdb') || '';
     if (!/^tt\d{4,10}$/.test(imdb)) return json({ ok: false, error: 'bad imdb' }, 400);

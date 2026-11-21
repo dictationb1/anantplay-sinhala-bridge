@@ -263,6 +263,26 @@ function kvMock() {
   check('no serviceWorker registration anywhere in the UI', swRefs.every((s) => !/serviceWorker/.test(s)));
 }
 
+// ── 6b. loopback upstreams stay blocked (lab parity must be an explicit opt-in) ──
+{
+  // /api/fetch-sub passes allowHttp:false — that hint must be authoritative even
+  // when a loopback host was allowlisted for a lab mirror.
+  let blocked = 0;
+  for (const u of ['http://127.0.0.1:8765/index.json', 'http://localhost/secret.srt']) {
+    try { await fetchUpstreamSub(u, { allowHttp: false, extraHosts: ['127.0.0.1', 'localhost'] }); }
+    catch (e) { blocked++; }
+  }
+  check('fetchUpstreamSub: explicit allowHttp:false blocks loopback even when allowlisted', blocked === 2, blocked);
+
+  // No allowHttp hint at all → implicit loopback auto-detect must NOT fire
+  // (production ALLOWED_SUB_HOSTS is empty).
+  let implicit = 0;
+  for (const u of ['http://127.0.0.1:8765/index.json', 'http://localhost/secret.srt', 'http://[::1]/x.srt']) {
+    try { await fetchUpstreamSub(u, { extraHosts: [] }); } catch (e) { implicit++; }
+  }
+  check('fetchUpstreamSub: loopback is never fetched implicitly (operator opt-in required)', implicit === 3, implicit);
+}
+
 // ── 7. token / content-type contract quotes the audit requirements ─────────
 {
   check('publish token format matches ^[a-f0-9]{8,64}$', /^[0-9a-f]{16}$/.test('0123456789abcdef'));
