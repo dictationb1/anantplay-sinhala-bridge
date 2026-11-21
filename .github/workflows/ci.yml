@@ -1,0 +1,66 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: tests + wrangler dry-run
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      # package-lock.json is committed, so `npm ci` is reproducible (wrangler is a pinned
+      # devDependency — no floating npx download).
+      - name: Install (locked)
+        run: npm ci --no-audit --no-fund
+
+      - name: Syntax gates
+        run: |
+          node --check worker/src/index.js
+          node --check bridge-ui/public/app.js
+          python3 -m py_compile local-server/server.py
+
+      - name: Worker tests (real .srt 200, catalogs, gz/zip, dedupe)
+        run: node tests/worker.test.js
+
+      - name: Fixture tests (shipped synthetic Sinhala fixtures)
+        run: node tests/fixtures.test.js
+
+      - name: Security regression tests (SSRF, zip-bomb, XSS surface, payload caps)
+        run: node tests/security.test.js
+
+      - name: Unified runner (every *.test.js, zero skipped)
+        run: node tests/run-all.js
+
+      - name: Real-HTTP local server end-to-end tests
+        run: python3 -m unittest discover -s tests -p 'local_server_test.py' -v
+
+      # No Cloudflare credentials are needed: --dry-run only builds the bundle, validates
+      # wrangler.toml ([assets] + optional KV) and exits before any API call. On failure the
+      # captured output is surfaced as a check annotation so the real error is visible.
+      - name: Wrangler deploy dry-run (no secrets)
+        env:
+          WRANGLER_SEND_METRICS: 'false'
+        run: |
+          set +e          # GitHub runs bash with -e; we need the exit code first
+          { ./node_modules/.bin/wrangler --version; ./node_modules/.bin/wrangler deploy --dry-run; } 2>&1 | tee wrangler-dry-run.log
+          rc=${PIPESTATUS[0]}
+          set -e
+          if [ "$rc" -ne 0 ]; then
+            echo "::error title=wrangler-dry-run-failed::$(tail -c 2500 wrangler-dry-run.log | tr '\n' '|')"
+            exit "$rc"
+          fi

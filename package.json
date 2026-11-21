@@ -1,0 +1,23 @@
+{
+  "name": "anantplay-si-subs-bridge",
+  "version": "2.1.0",
+  "private": true,
+  "description": "Real-HTTP .srt delivery bridge for AnantPlay Sinhala subtitles (Cloudflare Worker + LAN local server)",
+  "main": "worker/src/index.js",
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "test": "node tests/run-all.js",
+    "test:worker": "node tests/worker.test.js",
+    "test:fixtures": "node tests/fixtures.test.js",
+    "test:security": "node tests/security.test.js",
+    "test:local": "python3 -m unittest discover -s tests -p 'local_server_test.py' -v",
+    "syntax": "node --check worker/src/index.js && node --check bridge-ui/public/app.js && python3 -m py_compile local-server/server.py",
+    "deploy:dry": "wrangler deploy --dry-run"
+  },
+  "devDependencies": {
+    "wrangler": "4.166.0"
+  }
+}
