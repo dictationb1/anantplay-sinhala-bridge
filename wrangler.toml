@@ -1,27 +1,40 @@
-# AnantPlay Sinhala Subtitle Bridge — Cloudflare Worker (free tier)
-# One unified worker serves BOTH the Bridge UI (/index.html, /app.js, /style.css) and the
-# real /sub/<token>.srt endpoints, from a single origin.
+# AnantPlay Sinhala Subtitle Bridge v3 — Cloudflare Worker (free tier)
+# One unified worker serves BOTH the Bridge UI (/, /app.js, /style.css), the real
+# /sub/<token>.srt delivery AND the v3 Companion API (/api/resolve, /subtitles/:type/:id.json,
+# /api/paired/:jobId.json) from a single origin.
 #
 # Zero-config deploy: `npx wrangler deploy` just works — no KV namespace required.
-# Without a KV binding the worker stores subtitles in the Cache API (per-colo, 24h), so the
-# bridge is usable on the free tier immediately. For subtitles that must survive a cache
-# eviction and be readable from every colo, bind KV (recommended):
+# Without a KV binding the worker stores subtitles in the Cache API (per-colo, 24h) and
+# translation jobs in per-isolate memory (fine for testing; NOT the permanent cache), so
+# the bridge is usable on the free tier immediately. For subtitles that must survive cache
+# eviction, be readable from every colo, and make finished translation jobs PERMANENT,
+# bind KV (strongly recommended for the Companion):
 #
 #   npx wrangler kv namespace create SUBS_KV        # prints an id
 #   # then uncomment the block below and paste the id in
 #
+# v3 worker secrets (recommended — zero key typing on any phone):
+#   npx wrangler secret put GEMINI_API_KEY   # Gemini Flash EN→SI full-movie translation
+#   npx wrangler secret put SUBDL_API_KEY    # optional: SubDL 'si' human-subs provider
+#
+# v3 lab (Phase 4 Live Verification):
+#   node lab/verify_worker_e2e.mjs                      # boots wrangler dev + mock Gemini
+#   node lab/verify_worker_e2e.mjs --target https://anantplay-si-subs-bridge.techworldlk.workers.dev
+#   GEMINI_API_KEY=... node lab/verify_worker_e2e.mjs --use-real-gemini
+
 name = "anantplay-si-subs-bridge"
 main = "worker/src/index.js"
 compatibility_date = "2024-10-01"
 
 # Static Bridge UI, served by Cloudflare's asset layer on the same origin as the API.
-# Only non-asset paths (/index.json, /sites.json, /deeplinks.json, /api/*, /sub/*) reach the Worker.
+# Only non-asset paths (/index.json, /sites.json, /deeplinks.json, /api/*, /sub/*, /subtitles/*) reach the Worker.
 [assets]
 directory = "./bridge-ui/public"
 binding = "ASSETS"
 
-# Optional KV store (recommended, free tier). Commented out so `wrangler deploy` works with
-# no namespace id and CI's `wrangler deploy --dry-run` stays green.
+# Optional KV store (recommended for the Companion: permanent job cache + artifacts).
+# Commented out so `wrangler deploy` works with no namespace id and CI's
+# `wrangler deploy --dry-run` stays green.
 # [[kv_namespaces]]
 # binding = "SUBS_KV"
 # id = "PASTE_32_HEX_NAMESPACE_ID_HERE"
@@ -31,7 +44,8 @@ binding = "ASSETS"
 # [vars]
 # ALLOWED_SUB_HOSTS = "mysubtitles.example,mirror.example"
 
-# Optional R2 (not required; KV/Cache alone handles the 24h-TTL subtitle blobs):
-# [[r2_buckets]]
-# binding = "SUBS_R2"
-# bucket_name = "anantplay-si-subs"
+# Optional: override the Gemini model (default: gemini-flash-latest) — a Worker var, not a secret.
+# GEMINI_MODEL = "gemini-flash-latest"
+# Test/lab only: point the pipeline at a local mock Gemini (loopback is allowed, nothing else
+# non-https). Never set this in production.
+# GEMINI_API_BASE = "http://127.0.0.1:8788"

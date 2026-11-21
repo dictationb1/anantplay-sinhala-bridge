@@ -1,516 +1,64 @@
-/* AnantPlay Sinhala Subtitle Bridge — Cloudflare Worker v2.1 (real-HTTP .srt delivery).
+/* AnantPlay Sinhala Subtitle Bridge — Cloudflare Worker v3 (zero-fork edition).
  *
- * BUG #1 FIX: this worker serves the translated/processed UTF-8 .srt at REAL HTTP 200
- * URLs ending in .srt (/sub/<token>.srt), so ExoPlayer's DefaultDataSource — which runs
- * OUTSIDE the WebView and can NEVER read Service-Worker Cache Storage — fetches a real
- * file. The Bridge page fetch()es the same real URL first, so WebView's
- * shouldInterceptRequest (WebActivity.java:443-444) sees the genuine network request and
- * Sniffer.request() (Sniffer.java:105-110) captures it as a subtitle.
+ * ── v3 (this upgrade) — the standalone Companion API ──────────────────────────
+ *   GET /api/resolve?title=Clayface[&type=movie|series][&season=&episode=]
+ *        → IMDb id + clean title/year via Cinemeta (same service official AnantPlay uses).
+ *   GET /subtitles/:type/:id.json[?season=&episode=&title=&fresh=1]
+ *        → human Sinhala first (OpenSubtitles sin / SubDL si), else a Gemini Flash
+ *          EN→SI full-movie batch-translation job (worker secret GEMINI_API_KEY).
+ *   GET /api/paired/:jobId.json
+ *        → compact {i,t0,t1,en,enf,si} cue array — the Companion's <10 ms cue-lock data.
+ *   GET /sub/<token>.srt — real HTTP 200 UTF-8 SRT; 202 {status,progress,eta_sec}
+ *        while a job's Sinhala file is still translating (deterministic token).
+ *   GET /api/status — storage mode + which worker secrets are configured (booleans only).
+ *   GET /health — liveness probe.
  *
- * BUG #2 FIX: /api/search and /api/fetch-sub run server-side (real User-Agent header —
- * forbidden in browser fetch), gunzip .gz and unzip .zip, pick the best .srt/.vtt entry
- * (nested folders OK, __MACOSX/ skipped, .. traversal rejected), convert to BOM-less
- * UTF-8 and publish at a real /sub/<token>.srt URL.
+ * ── kept from v2.1 (Arena PR #1 security hardening, all tests preserved) ──────
+ *   BUG #1 FIX: real HTTP 200 .srt URLs (/sub/<token>.srt) so ExoPlayer's
+ *   DefaultDataSource — running OUTSIDE the WebView — fetches a real file, and the
+ *   WebView sees the genuine network request so Sniffer captures it as a subtitle.
+ *   BUG #2 FIX: /api/search and /api/fetch-sub run server-side (real User-Agent),
+ *   gunzip .gz and unzip .zip (best .srt entry, __MACOSX/ skipped, .. traversal
+ *   rejected), convert to BOM-less UTF-8 and publish at a real /sub/<token>.srt URL.
+ *   v2.1 SECURITY: strict subtitle-provider allowlist re-validated on every redirect
+ *   hop; credentials/ports/IP-literals/private hosts rejected; 5 MB upstream and
+ *   decompression caps (zip/gzip-bomb guard); 2 MB publish cap; strict token format.
  *
- * v2.1 SECURITY FIX (SSRF / zip-bomb / payload caps):
- *   - /api/fetch-sub only accepts https URLs on a strict subtitle-provider allowlist,
- *     re-validated on every redirect hop; credentials, non-443/80 ports, IP literals,
- *     loopback/RFC1918/CGNAT/link-local/.local hosts are rejected.
- *   - upstream bodies and every gunzip/unzip result are size-capped (5 MB), so a
- *     gzip/zip bomb can never exhaust the isolate.
- *   - /api/publish-srt caps decoded subtitle size at 2 MB and validates the token format.
- *
- * Storage: Cloudflare KV when bound (24h TTL, SHA-256 deduplicated — token = first 16 hex
- * of the content hash, so identical content re-publishes to the same URL). When KV is NOT
- * bound the worker degrades to the Cache API so a zero-config deploy still works instead
- * of throwing on `env.SUBS_KV`.
+ * Storage: KV when bound (recommended — permanent job cache + artifacts). Without
+ * KV the worker degrades to the Cache API (+ per-isolate job Map) so a zero-config
+ * deploy still works.
  */
 
-// ─────────────────────────────────────────────────────────────────────────────
-// limits + security policy
-// ─────────────────────────────────────────────────────────────────────────────
+import {
+  MAX_B64_CHARS, MAX_UNCOMPRESSED_BYTES, MAX_PUBLISH_BYTES,
+  sha256Hex, isValidToken, toCleanSrt, parseSrtCues, reassembleSrt, hasStorage,
+  publishSrt, getSrt, isGzip, isZip, zipEntries, pickBestEntry, entryRank,
+  isSubtitleEntry, unzipBest, decompressAny, openSubsSearch, stremioOsSearch, subdlSearch,
+  pirateLkSearch, fetchUpstreamSub, assertSafeUpstreamUrl, isPrivateHost, hostAllowed,
+  safeFetchBytes, readStreamCapped, b64ToBytes, json, SRT_HEADERS, limits,
+} from './lib.js';
 
-const TOKEN_LEN = 16; // hex chars of the SHA-256 used as the token
-const TTL_SECONDS = 24 * 3600; // 24h KV TTL
-const MAX_UPSTREAM_BYTES = 5 * 1024 * 1024; // 5 MiB compressed download cap
-const MAX_UNCOMPRESSED_BYTES = 5 * 1024 * 1024; // 5 MiB gunzip/unzip cap (zip-bomb guard)
-const MAX_PUBLISH_BYTES = 2 * 1024 * 1024; // 2 MiB finished .srt cap
-const MAX_B64_CHARS = Math.ceil((MAX_PUBLISH_BYTES * 4) / 3) + 1024;
-const MAX_REDIRECTS = 3;
-const UPSTREAM_TIMEOUT_MS = 15000;
-const CACHE_STORE_ORIGIN = 'https://si-bridge-substore.invalid';
+import {
+  PIPELINE_VERSION, JOB_ID_RE, jobIdOf,
+  cinemetaResolve, cinemetaMeta, flattenLikeAnantPlay, parseTsMs, buildPairedCues,
+  geminiKeyOf, geminiModelOf, geminiBaseOf, geminiTranslateBatch, translateBatchRobust,
+  makeBatches, ensureSubtitleJob, resumeTranslationJob, getPaired, jobForToken,
+  getJob, kvGet, kvPut, deterministicToken,
+} from './pipeline.js';
 
-/** Subtitle providers the bridge is allowed to download from. Subdomains match too. */
-const DEFAULT_ALLOWED_HOSTS = [
-  'opensubtitles.org',
-  'opensubtitles.com',
-  'subdl.com',
-  'subdl.org',
-  'piratelk.com',
-];
-
-const TOKEN_RE = /^[0-9a-f]{16}$/;
-
-// ─────────────────────────────────────────────────────────────────────────────
-// shared helpers (exported for tests via `export`)
-// ─────────────────────────────────────────────────────────────────────────────
-
-function hexOf(bytes) {
-  let out = '';
-  for (let i = 0; i < bytes.length; i++) out += ('0' + bytes[i].toString(16)).slice(-2);
-  return out;
-}
-
-async function sha256Hex(data) {
-  const d = typeof data === 'string' ? new TextEncoder().encode(data) : new Uint8Array(data);
-  const h = await crypto.subtle.digest('SHA-256', d);
-  return hexOf(new Uint8Array(h));
-}
-
-/** True when bytes start with the gzip magic 1f 8b. */
-function isGzip(bytes) {
-  return bytes.length > 1 && bytes[0] === 0x1f && bytes[1] === 0x8b;
-}
-
-/** True when bytes start with the ZIP magic PK\x03\x04. */
-function isZip(bytes) {
-  return bytes.length > 3 && bytes[0] === 0x50 && bytes[1] === 0x4b && bytes[2] === 0x03 && bytes[3] === 0x04;
-}
-
-/** Parse a ZIP's central directory WITHOUT inflating entries (works on plain Uint8Array).
- * Returns [{name, method, csize, usize, localHeaderOffset}] — the reader only needs names
- * + sizes to pick the best entry; the actual inflate happens in inflateEntry(). */
-function zipEntries(bytes) {
-  const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
-  const findEOCD = () => {
-    const start = Math.max(0, bytes.length - 65557);
-    for (let i = bytes.length - 22; i >= start; i--) {
-      if (bytes[i] === 0x50 && bytes[i + 1] === 0x4b && bytes[i + 2] === 0x05 && bytes[i + 3] === 0x06) {
-        return i;
-      }
-    }
-    return -1;
-  };
-  const eocd = findEOCD();
-  if (eocd < 0) return [];
-  const count = dv.getUint16(eocd + 8, true); // EOCD+8: total entries on this disk
-  let off = dv.getUint32(eocd + 16, true);
-  const out = [];
-  for (let n = 0; n < count && n < 4096; n++) {
-    if (off + 46 > bytes.length) break;
-    if (dv.getUint32(off, true) !== 0x02014b50) break; // central file header signature
-    const method = dv.getUint16(off + 10, true);
-    const csize = dv.getUint32(off + 20, true);
-    const usize = dv.getUint32(off + 24, true);
-    const nameLen = dv.getUint16(off + 28, true);
-    const extraLen = dv.getUint16(off + 30, true);
-    const commentLen = dv.getUint16(off + 32, true);
-    const lho = dv.getUint32(off + 42, true);
-    const name = new TextDecoder().decode(bytes.subarray(off + 46, off + 46 + nameLen));
-    out.push({ name, method, csize, usize, localHeaderOffset: lho });
-    off += 46 + nameLen + extraLen + commentLen;
-  }
-  return out;
-}
-
-/** Is this ZIP entry a candidate subtitle we accept? (.srt/.vtt, not __MACOSX/, no ..) */
-function isSubtitleEntry(name) {
-  const n = String(name || '').toLowerCase();
-  if (!n) return false;
-  if (n.indexOf('__macosx/') === 0 || n.indexOf('__macosx\\') === 0) return false;
-  // reject absolute paths and Windows drive letters as well as `..` traversal
-  if (n.startsWith('/') || n.startsWith('\\') || /^[a-z]:[\\/]/.test(n)) return false;
-  if (n.split('/').some((p) => p === '..') || n.split('\\').some((p) => p === '..')) return false;
-  return /\.srt$/.test(n) || /\.vtt$/.test(n);
-}
-
-/** Rank: prefer .srt in the archive root, then nested; then .vtt. Sinhala-named files rank higher. */
-function entryRank(e) {
-  const n = String(e && e.name ? e.name : '').toLowerCase();
-  let score = 0;
-  if (n.endsWith('.srt')) score += 100;
-  if (n.endsWith('.vtt')) score += 40;
-  const depth = n.split('/').length;
-  score -= depth * 5; // shallower = better
-  if (/[සිංහල]|sinhala|(^|[-._])si\b|[-._]si[._-]|\.si\./.test(n)) score += 30;
-  if (n.length < 40) score += 10;
-  return score;
-}
-
-function pickBestEntry(entries) {
-  const subs = entries.filter((e) => isSubtitleEntry(e.name) && e.usize <= MAX_UNCOMPRESSED_BYTES);
-  if (!subs.length) return null;
-  let best = subs[0];
-  for (const e of subs) if (entryRank(e) > entryRank(best)) best = e;
-  return best;
-}
-
-/** Read a ReadableStream with a hard byte cap (zip/gzip-bomb guard). */
-async function readStreamCapped(stream, maxBytes) {
-  if (!stream || typeof stream.getReader !== 'function') {
-    const buf = new Uint8Array(await new Response(stream).arrayBuffer());
-    if (buf.length > maxBytes) throw new Error('decompressed content too large');
-    return buf;
-  }
-  const reader = stream.getReader();
-  const chunks = [];
-  let total = 0;
-  for (;;) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    total += value.length;
-    if (total > maxBytes) {
-      try { await reader.cancel(); } catch (e) { /* already closed */ }
-      throw new Error('decompressed content too large');
-    }
-    chunks.push(value);
-  }
-  const out = new Uint8Array(total);
-  let o = 0;
-  for (const c of chunks) { out.set(c, o); o += c.length; }
-  return out;
-}
-
-/** Read a fetch Response body with a hard byte cap. */
-async function readResponseCapped(res, maxBytes) {
-  const declared = Number(res.headers.get('content-length') || 0);
-  if (declared && declared > maxBytes) throw new Error('upstream file too large');
-  if (!res.body || typeof res.body.getReader !== 'function') {
-    const buf = new Uint8Array(await res.arrayBuffer());
-    if (buf.length > maxBytes) throw new Error('upstream file too large');
-    return buf;
-  }
-  return readStreamCapped(res.body, maxBytes);
-}
-
-/** gunzip with a size cap. */
-async function gunzipCapped(bytes, maxBytes = MAX_UNCOMPRESSED_BYTES) {
-  const ds = new DecompressionStream('gzip');
-  const piped = new Response(bytes).body.pipeThrough(ds);
-  return readStreamCapped(piped, maxBytes);
-}
-
-/** Inflate ONE zip entry (method 0 stored / 8 deflate) via DecompressionStream. */
-async function inflateEntry(bytes, entry) {
-  const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
-  const off = entry.localHeaderOffset;
-  if (off + 30 > bytes.length || dv.getUint32(off, true) !== 0x04034b50) throw new Error('bad local header');
-  if (entry.usize > MAX_UNCOMPRESSED_BYTES) throw new Error('zip entry too large (zip-bomb guard)');
-  const nameLen = dv.getUint16(off + 26, true);
-  const extraLen = dv.getUint16(off + 28, true);
-  const dataStart = off + 30 + nameLen + extraLen;
-  if (dataStart > bytes.length) throw new Error('bad local header');
-  const raw = bytes.subarray(dataStart, dataStart + entry.csize);
-  if (entry.method === 0) {
-    if (raw.length > MAX_UNCOMPRESSED_BYTES) throw new Error('zip entry too large (zip-bomb guard)');
-    return new Uint8Array(raw);
-  }
-  if (entry.method !== 8) throw new Error('unsupported zip method ' + entry.method);
-  const ds = new DecompressionStream('deflate-raw');
-  const stream = new Response(raw).body.pipeThrough(ds);
-  return readStreamCapped(stream, MAX_UNCOMPRESSED_BYTES);
-}
-
-/** Extract the best .srt/.vtt from a ZIP (Uint8Array) → {bytes, name} or null. */
-async function unzipBest(zipBytes) {
-  const entries = zipEntries(zipBytes);
-  const best = pickBestEntry(entries);
-  if (!best) return null;
-  const bytes = await inflateEntry(zipBytes, best);
-  return { bytes, name: best.name };
-}
-
-/** Normalize ANY subtitle text (srt or vtt) into a clean BOM-less UTF-8 SRT string.
- * - strips BOM, unifies newlines, trims trailing whitespace
- * - validates it actually looks like a subtitle (has --> timings or WEBVTT header)
- * Returns {text, wasVtt} or throws. */
-function toCleanSrt(text) {
-  if (typeof text !== 'string') throw new Error('subtitle must be text');
-  if (text.charCodeAt(0) === 0xfeff) text = text.slice(1);
-  const wasVtt = /^\ufeff?WEBVTT/.test(text.trimStart());
-  text = text.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
-  text = text.replace(/\n{3,}/g, '\n\n').replace(/\s+$/, '') + '\n';
-  if (!wasVtt && !text.includes('-->')) throw new Error('not a subtitle file (no "-->" cues)');
-  if (new TextEncoder().encode(text).length > MAX_PUBLISH_BYTES) throw new Error('subtitle too large (2 MB max)');
-  return { text, wasVtt };
-}
-
-/** Split an SRT into cues [{idx, ts, lines}] — used by the translation batcher. */
-function parseSrtCues(text) {
-  const cues = [];
-  const blocks = String(text).split(/\n\n+/);
-  for (const b of blocks) {
-    const lines = b.split('\n').filter((l) => l.trim() !== '');
-    if (lines.length < 2) continue;
-    let i = 0;
-    if (/^\d+$/.test(lines[0].trim())) i = 1;
-    if (!lines[i] || !lines[i].includes('-->')) continue;
-    cues.push({ idx: cues.length, ts: lines[i], lines: lines.slice(i + 1) });
-  }
-  return cues;
-}
-
-function reassembleSrt(cues) {
-  return cues
-    .map((c, n) => (n + 1) + '\n' + c.ts + '\n' + c.lines.join('\n'))
-    .join('\n\n') + '\n';
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// SSRF protection (Gate 4)
-// ─────────────────────────────────────────────────────────────────────────────
-
-/** Loopback / private / link-local / metadata / internal-only hosts. */
-function isPrivateHost(hostname) {
-  let h = String(hostname || '').toLowerCase().replace(/\.$/, '');
-  if (h.startsWith('[') && h.endsWith(']')) h = h.slice(1, -1);
-  if (!h) return true;
-  if (h === 'localhost' || h === 'localhost.localdomain') return true;
-  if (/\.(localhost|local|internal|home\.arpa|intranet|lan)$/.test(h)) return true;
-  if (h.includes(':')) return true; // never allow raw IPv6 literals upstream
-  const m = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(h);
-  if (!m) return false;
-  const a = Number(m[1]);
-  const b = Number(m[2]);
-  if (a === 0 || a === 10 || a === 127) return true; // this-network, private, loopback
-  if (a === 169 && b === 254) return true; // link-local + 169.254.169.254 metadata
-  if (a === 172 && b >= 16 && b <= 31) return true; // RFC1918
-  if (a === 192 && b === 168) return true; // RFC1918
-  if (a === 100 && b >= 64 && b <= 127) return true; // CGNAT
-  if (a === 198 && (b === 18 || b === 19)) return true; // benchmarking
-  if (a >= 224) return true; // multicast + reserved
-  return false;
-}
-
-/** Exact host or a subdomain of an allowlisted provider. */
-function hostAllowed(hostname, extraHosts) {
-  const h = String(hostname || '').toLowerCase().replace(/\.$/, '').replace(/^www\./, '');
-  if (!h) return false;
-  const list = DEFAULT_ALLOWED_HOSTS.concat(Array.isArray(extraHosts) ? extraHosts : []);
-  return list.some((allowed) => {
-    const a = String(allowed || '').toLowerCase().trim().replace(/^www\./, '');
-    return a && (h === a || h.endsWith('.' + a));
-  });
-}
-
-/** Parse + validate one upstream subtitle URL. Throws on anything unsafe.
- * opts: {allowHttp, extraHosts} — extraHosts is `env.ALLOWED_SUB_HOSTS` (comma list). */
-function assertSafeUpstreamUrl(raw, opts) {
-  const o = opts || {};
-  let u;
-  try {
-    u = new URL(String(raw || ''));
-  } catch (e) {
-    throw new Error('invalid subtitle URL');
-  }
-  if (u.protocol !== 'https:' && !(o.allowHttp === true && u.protocol === 'http:')) {
-    throw new Error('only https upstream URLs are allowed');
-  }
-  if (u.username || u.password) throw new Error('upstream URL must not contain credentials');
-  if (u.port && u.port !== '443' && u.port !== '80') throw new Error('upstream port not allowed');
-  if (isPrivateHost(u.hostname)) throw new Error('upstream host is private/loopback — SSRF blocked');
-  if (!hostAllowed(u.hostname, o.extraHosts)) throw new Error('upstream host not allowlisted: ' + u.hostname);
-  return u;
-}
-
-/** fetch() wrapper: allowlist + per-hop redirect re-validation + timeout + size cap. */
-async function safeFetchBytes(rawUrl, opts) {
-  const o = opts || {};
-  const headers = o.headers || { 'User-Agent': OS_UA, 'Accept': '*/*' };
-  const maxBytes = o.maxBytes || MAX_UPSTREAM_BYTES;
-  let url = assertSafeUpstreamUrl(rawUrl, o);
-  for (let hop = 0; hop <= MAX_REDIRECTS; hop++) {
-    const res = await fetch(url.toString(), {
-      headers,
-      redirect: 'manual',
-      signal: typeof AbortSignal !== 'undefined' && AbortSignal.timeout ? AbortSignal.timeout(o.timeoutMs || UPSTREAM_TIMEOUT_MS) : undefined,
-    });
-    if (res.status >= 300 && res.status < 400) {
-      const loc = res.headers.get('location');
-      if (!loc) throw new Error('upstream redirect without a location');
-      url = assertSafeUpstreamUrl(new URL(loc, url).toString(), o); // every hop re-checked
-      continue;
-    }
-    if (!res.ok) throw new Error('upstream ' + res.status);
-    return { bytes: await readResponseCapped(res, maxBytes), headers: res.headers, url: url.toString() };
-  }
-  throw new Error('too many upstream redirects');
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// storage (KV first, Cache API fallback, SHA-256 dedupe, 24h TTL)
-// ─────────────────────────────────────────────────────────────────────────────
-
-function hasStorage(env) {
-  if (env && env.SUBS_KV) return true;
-  try {
-    return !!(typeof caches !== 'undefined' && caches && caches.default);
-  } catch (e) {
-    return false;
-  }
-}
-
-function cacheStore() {
-  try {
-    return typeof caches !== 'undefined' && caches && caches.default ? caches.default : null;
-  } catch (e) {
-    return null;
-  }
-}
-
-async function publishSrt(env, text) {
-  const token = (await sha256Hex(text)).slice(0, TOKEN_LEN);
-  const key = 'sub:' + token;
-  if (env && env.SUBS_KV) {
-    // metadata-only write refreshes TTL without re-uploading the blob
-    const existing = await env.SUBS_KV.get(key);
-    if (!existing) await env.SUBS_KV.put(key, text, { expirationTtl: TTL_SECONDS });
-  } else {
-    const c = cacheStore();
-    if (c) {
-      const req = new Request(CACHE_STORE_ORIGIN + '/sub/' + token + '.srt');
-      const hit = await c.match(req);
-      if (!hit) {
-        await c.put(req, new Response(text, {
-          headers: { 'Content-Type': 'application/x-subrip; charset=utf-8', 'Cache-Control': 'public, max-age=' + TTL_SECONDS },
-        }));
-      }
-    }
-  }
-  return { token, url: '/sub/' + token + '.srt' };
-}
-
-function isValidToken(token) {
-  return TOKEN_RE.test(String(token || ''));
-}
-
-async function getSrt(env, token) {
-  if (!isValidToken(token)) return null;
-  if (env && env.SUBS_KV) {
-    return (await env.SUBS_KV.get('sub:' + token)) || null;
-  }
-  const c = cacheStore();
-  if (!c) return null;
-  const hit = await c.match(new Request(CACHE_STORE_ORIGIN + '/sub/' + token + '.srt'));
-  return hit ? await hit.text() : null;
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// upstream subtitle providers (server-side only — real User-Agent)
-// ─────────────────────────────────────────────────────────────────────────────
-
-const OS_UA = 'TemporaryUserAgent'; // OpenSubtitles legacy REST required UA (SubOs.java:26)
-const SUBDL_UA = 'Mozilla/5.0 (X11; Linux x86_64) AnantPlaySiBridge/2.1';
-
-async function openSubsSearch(imdb, season, episode, lang, langs) {
-  // legacy REST: /search/imdbid-XXX/sublanguageid-XXX/season-N/episode-N  (SubOs.java)
-  let url = 'https://rest.opensubtitles.org/search/imdbid-' + encodeURIComponent(imdb);
-  const want = langs && langs.length ? langs : ['sin', 'eng'];
-  url += '/sublanguageid-' + want.join(',');
-  if (season) url += '/season-' + season;
-  if (episode && episode > 0) url += '/episode-' + episode;
-  const res = await fetch(url, {
-    headers: { 'User-Agent': OS_UA, 'Accept': 'application/json' },
-    redirect: 'manual',
-    signal: typeof AbortSignal !== 'undefined' && AbortSignal.timeout ? AbortSignal.timeout(UPSTREAM_TIMEOUT_MS) : undefined,
-  });
-  if (!res.ok) return [];
-  const arr = await res.json();
-  if (!Array.isArray(arr)) return [];
-  return arr.slice(0, 40).map((r) => ({
-    provider: 'opensubtitles',
-    id: String(r.IDSubtitleFile || ''),
-    url: r.SubDownloadLink || '', // ends .gz — BUG #2: must be fetched server-side
-    lang: r.SubLanguageID || r.ISO639 || 'en',
-    release: r.MovieReleaseName || r.SubFileName || '',
-    format: 'srt',
-    hearingImpaired: !!(r.SubHearingImpaired && String(r.SubHearingImpaired) === '1'),
-    downloads: Number(r.SubDownloadsCnt || 0),
-  })).filter((r) => r.url);
-}
-
-async function subdlSearch(imdb, season, episode, lang, apiKey) {
-  if (!apiKey) return []; // needs the user's key — passed as X-SubDL-Key
-  const q = new URLSearchParams({ imdb_id: imdb, languages: 'si,en', dl: '1' });
-  if (season) q.set('season', String(season));
-  if (episode && episode > 0) q.set('episode', String(episode));
-  const res = await fetch('https://api.subdl.com/api/v1/subtitles?' + q.toString(), {
-    headers: { 'User-Agent': SUBDL_UA, 'X-SubDL-Key': apiKey },
-    redirect: 'manual',
-    signal: typeof AbortSignal !== 'undefined' && AbortSignal.timeout ? AbortSignal.timeout(UPSTREAM_TIMEOUT_MS) : undefined,
-  });
-  if (!res.ok) return [];
-  const j = await res.json().catch(() => null);
-  const arr = j && j.subtitles ? j.subtitles : [];
-  return arr.slice(0, 40).map((s) => ({
-    provider: 'subdl',
-    id: String(s.id || ''),
-    url: s.url ? (/^https?:\/\//.test(s.url) ? s.url : 'https://dl.subdl.com' + s.url) : '', // .zip download — fetched server-side
-    lang: s.language || 'si',
-    release: s.release_name || s.name || '',
-    format: 'srt',
-    hearingImpaired: false,
-    downloads: 0,
-  })).filter((r) => r.url);
-}
-
-/** piratelk.com listing pages — robots.txt is honoured before any hint is returned. */
-async function pirateLkSearch(imdb, titleHint) {
-  try {
-    const rb = await fetch('https://piratelk.com/robots.txt', {
-      headers: { 'User-Agent': SUBDL_UA },
-      redirect: 'manual',
-      signal: typeof AbortSignal !== 'undefined' && AbortSignal.timeout ? AbortSignal.timeout(8000) : undefined,
-    });
-    if (rb.ok) {
-      const txt = await rb.text();
-      if (/^\s*Disallow:\s*\/\s*$/m.test(txt)) return []; // site-wide disallow → stay out
-    }
-    // NOTE: piratelk results are page-structured, not an API; the worker returns them
-    // only as {provider:'piratelk', url:<listing page>} hints the Bridge can open.
-    if (!titleHint) return [];
-    return [{ provider: 'piratelk', id: 'hint', url: 'https://piratelk.com/?s=' + encodeURIComponent(titleHint), lang: 'si', release: titleHint, format: 'zip', hearingImpaired: false, downloads: 0 }];
-  } catch (e) {
-    return [];
-  }
-}
-
-/** gunzip / unzip / passthrough → raw subtitle bytes + entry name. All paths capped. */
-async function decompressAny(bytes) {
-  if (isGzip(bytes)) return { bytes: await gunzipCapped(bytes), name: '' };
-  if (isZip(bytes)) {
-    const best = await unzipBest(bytes);
-    if (!best) throw new Error('no subtitle entry inside zip');
-    return { bytes: best.bytes, name: best.name };
-  }
-  if (bytes.length > MAX_UNCOMPRESSED_BYTES) throw new Error('subtitle file too large');
-  return { bytes, name: '' };
-}
-
-/** Download + extract + normalize ONE upstream subtitle → clean UTF-8 SRT string.
- * Handles .gz (OpenSubtitles) and .zip (SubDL/piratelk) and plain .srt/.vtt. */
-async function fetchUpstreamSub(url, opts) {
-  const got = await safeFetchBytes(url, opts);
-  const data = await decompressAny(got.bytes);
-  const text = new TextDecoder('utf-8', { fatal: false }).decode(data.bytes);
-  return toCleanSrt(text).text;
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// responses
-// ─────────────────────────────────────────────────────────────────────────────
-
-const JSON_HEADERS = { 'Access-Control-Allow-Origin': '*', 'Content-Type': 'application/json; charset=utf-8' };
-const SRT_HEADERS = {
-  'Access-Control-Allow-Origin': '*',
-  'Content-Type': 'application/x-subrip; charset=utf-8',
-  'Cache-Control': 'public, max-age=86400',
-  'X-Content-Type-Options': 'nosniff',
+export {
+  // lib (v2.1 exports kept — every existing test keeps passing unchanged)
+  sha256Hex, toCleanSrt, parseSrtCues, reassembleSrt, isGzip, isZip, zipEntries,
+  pickBestEntry, entryRank, isSubtitleEntry, unzipBest, decompressAny, publishSrt,
+  getSrt, hasStorage, isValidToken, openSubsSearch, stremioOsSearch, subdlSearch, pirateLkSearch,
+  fetchUpstreamSub, assertSafeUpstreamUrl, isPrivateHost, hostAllowed, safeFetchBytes,
+  readStreamCapped, limits, catalogRoutes,
+  // v3 pipeline (functions only — workerd rejects exported constants)
+  cinemetaResolve, cinemetaMeta, flattenLikeAnantPlay, parseTsMs, buildPairedCues,
+  geminiKeyOf, geminiModelOf, geminiBaseOf, geminiTranslateBatch, translateBatchRobust,
+  makeBatches, ensureSubtitleJob, resumeTranslationJob, getPaired, jobForToken,
+  getJob, kvGet, kvPut, deterministicToken, jobIdOf, handleRequest,
 };
-
-function json(obj, status) {
-  return new Response(JSON.stringify(obj), { status: status || 200, headers: JSON_HEADERS });
-}
 
 /** The dynamic index/sites/deeplinks JSONs — generated from the LIVE host, so there is
  * never a placeholder YOUR-HOST to forget. Shapes verified against AnantPlay v2.23.1:
@@ -553,26 +101,43 @@ function catalogRoutes(url) {
   };
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// body parsing (JSON text / b64 / multipart), all size-capped
-// ─────────────────────────────────────────────────────────────────────────────
-
-function b64ToBytes(b64) {
-  const s = atob(String(b64 || ''));
-  const out = new Uint8Array(s.length);
-  for (let i = 0; i < s.length; i++) out[i] = s.charCodeAt(i);
-  return out;
-}
-
-/** Turn an uploaded payload (raw bytes: srt/vtt/zip/gz) into clean SRT text. */
-async function bytesToSubtitle(bytes) {
-  if (bytes.length > MAX_UNCOMPRESSED_BYTES) throw new Error('upload too large (5 MB max)');
-  const data = await decompressAny(bytes);
-  return toCleanSrt(new TextDecoder('utf-8', { fatal: false }).decode(data.bytes));
+/** Shape the pipeline result into the /subtitles/:type/:id.json body (Stremio-addon
+ * compatible `subtitles` array included, so the bridge can also be added as a plain
+ * subtitle source for any Stremio-shaped client). */
+function subtitleJobBody(origin, job) {
+  const base = {
+    ok: true, jobId: job.id, type: job.type, imdb: job.imdb, season: job.season, episode: job.episode,
+    status: job.status, source: job.source || null, cues: job.cues || 0,
+  };
+  if (job.status === 'done') {
+    base.si = { url: origin + '/sub/' + job.siToken + '.srt', token: job.siToken, lang: 'sin' };
+    base.en = job.enToken ? { url: origin + '/sub/' + job.enToken + '.srt', token: job.enToken, lang: 'eng' } : null;
+    base.paired = '/api/paired/' + job.id + '.json';
+    base.subtitles = [{ id: job.id + ':sin', url: base.si.url, lang: 'sin' }];
+    if (base.en) base.subtitles.push({ id: job.id + ':eng', url: base.en.url, lang: 'eng' });
+    return base;
+  }
+  if (job.status === 'translating') {
+    const done = job.done || 0, total = job.total || 1;
+    const eta = job.startedAt && done > 0 ? Math.max(1, Math.round(((Date.now() - job.startedAt) / done) * (total - done) / 1000)) : null;
+    base.progress = +(done / total).toFixed(3);
+    base.done = done;
+    base.total = total;
+    base.eta_sec = eta;
+    base.si = { url: origin + '/sub/' + job.siToken + '.srt', token: job.siToken, lang: 'sin' }; // deterministic: 202 until done
+    base.en = job.enToken ? { url: origin + '/sub/' + job.enToken + '.srt', token: job.enToken, lang: 'eng' } : null;
+    base.paired = '/api/paired/' + job.id + '.json';
+    base.subtitles = []; // Stremio clients expect an empty list, not an error
+    return base;
+  }
+  base.ok = false;
+  base.error = job.error || 'job failed';
+  base.subtitles = [];
+  return base;
 }
 
 /** the fetch handler (exported; also the entry point of the deployed worker) */
-async function handleRequest(request, env) {
+async function handleRequest(request, env, ctx) {
   const url = new URL(request.url);
   const p = url.pathname;
 
@@ -583,9 +148,28 @@ async function handleRequest(request, env) {
       headers: {
         'Access-Control-Allow-Origin': '*',
         'Access-Control-Allow-Methods': 'GET,POST,OPTIONS',
-        'Access-Control-Allow-Headers': 'Content-Type, X-SubDL-Key, X-Gemini-Key',
+        'Access-Control-Allow-Headers': 'Content-Type, X-SubDL-Key, X-Gemini-Key, X-Gemini-Model',
         'Access-Control-Max-Age': '86400',
       },
+    });
+  }
+
+  // ── liveness + status ──
+  if (p === '/health' && (request.method === 'GET' || request.method === 'HEAD')) {
+    return json({ ok: true, status: 'ok', version: PIPELINE_VERSION });
+  }
+  if (p === '/api/status' && request.method === 'GET') {
+    const l = limits();
+    return json({
+      ok: true, version: PIPELINE_VERSION,
+      storage: env && env.SUBS_KV ? 'kv' : 'cache+memory',
+      secrets: {
+        gemini: geminiKeyOf(env, request.headers) !== '' || !!(env && env.GEMINI_API_KEY),
+        subdl: !!(env && env.SUBDL_API_KEY),
+      },
+      model: geminiModelOf(env, request.headers),
+      limits: l,
+      companion: { defaultWorkerUrl: 'https://anantplay-si-subs-bridge.techworldlk.workers.dev' },
     });
   }
 
@@ -598,7 +182,19 @@ async function handleRequest(request, env) {
     } catch (e) {
       text = null;
     }
-    if (text === null) return new Response('subtitle expired or not found\n', { status: 404, headers: { 'Content-Type': 'text/plain; charset=utf-8', 'Access-Control-Allow-Origin': '*' } });
+    if (text === null) {
+      // a pipeline job token? → the deterministic 202-progress contract
+      const job = await jobForToken(env, subMatch[1]);
+      if (job && job.status === 'translating') {
+        const done = job.done || 0, total = job.total || 1;
+        const eta = job.startedAt && done > 0 ? Math.max(1, Math.round(((Date.now() - job.startedAt) / done) * (total - done) / 1000)) : null;
+        return json({ status: 'translating', progress: +(done / total).toFixed(3), done, total, eta_sec: eta }, 202);
+      }
+      if (job && job.status === 'error') {
+        return json({ status: 'error', error: job.error || 'job failed' }, 410);
+      }
+      return new Response('subtitle expired or not found\n', { status: 404, headers: { 'Content-Type': 'text/plain; charset=utf-8', 'Access-Control-Allow-Origin': '*' } });
+    }
     if (request.method === 'HEAD') return new Response(null, { status: 200, headers: SRT_HEADERS });
     return new Response(text, { status: 200, headers: SRT_HEADERS });
   }
@@ -607,6 +203,53 @@ async function handleRequest(request, env) {
   const cat = catalogRoutes(url);
   if (cat[p] && (request.method === 'GET' || request.method === 'HEAD')) return json(cat[p]);
 
+  // ── v3: Cinemeta resolve (title → IMDb; the Companion's zero-typing path) ──
+  if (p === '/api/resolve' && request.method === 'GET') {
+    const imdbIn = String(url.searchParams.get('imdb') || '').trim();
+    const type = url.searchParams.get('type') === 'series' ? 'series' : 'movie';
+    const season = Math.max(0, Math.min(999, Number(url.searchParams.get('season') || 0) || 0));
+    const episode = Math.max(0, Math.min(9999, Number(url.searchParams.get('episode') || 0) || 0));
+    if (/^tt\d{4,10}$/.test(imdbIn)) {
+      const meta = await cinemetaMeta(type, imdbIn).catch(() => ({ imdb: imdbIn, name: imdbIn, year: '' }));
+      return json({ ok: true, type, imdb: imdbIn, name: meta.name, year: meta.year, season, episode });
+    }
+    const title = String(url.searchParams.get('title') || '').trim();
+    if (title.length < 2) return json({ ok: false, error: 'give ?title=… (min 2 chars) or ?imdb=tt…' }, 400);
+    const hit = await cinemetaResolve(title, type).catch(() => null);
+    if (!hit) return json({ ok: false, error: 'no Cinemeta match for: ' + title.slice(0, 80) }, 404);
+    return json({ ok: true, type, imdb: hit.imdb, name: hit.name, year: hit.year, season, episode });
+  }
+
+  // ── v3: the Companion's main endpoint (Stremio-addon shaped) ──
+  const subsMatch = /^\/subtitles\/(movie|series)\/(tt\d{4,10})(?:\.json)?$/.exec(p);
+  if (subsMatch && request.method === 'GET') {
+    const r = await ensureSubtitleJob(env, ctx, {
+      type: subsMatch[1],
+      imdb: subsMatch[2],
+      season: url.searchParams.get('season'),
+      episode: url.searchParams.get('episode'),
+      title: url.searchParams.get('title') || '',
+      fresh: url.searchParams.get('fresh') === '1',
+      subdlKey: request.headers.get('X-SubDL-Key') || '',
+      headers: request.headers,
+    });
+    if (r.badRequest) return json({ ok: false, error: r.badRequest }, 400);
+    if (r.started && ctx && typeof ctx.waitUntil === 'function') ctx.waitUntil(r.started);
+    if (r.needsKey) return json({ ok: false, status: 'needs-key', error: r.needsKey, subtitles: [] });
+    if (r.notFound) return json({ ok: false, status: 'not-found', error: r.error || 'no subtitle found', hints: r.hints || [], subtitles: [] });
+    return json(subtitleJobBody(url.origin, r.job));
+  }
+
+  // ── v3: the <10 ms cue-lock payload ──
+  const pairedMatch = /^\/api\/paired\/((?:movie|series):tt\d{4,10}:\d{1,4}:\d{1,5})(?:\.json)?$/.exec(p);
+  if (pairedMatch && request.method === 'GET') {
+    const jobId = pairedMatch[1];
+    if (!JOB_ID_RE.test(jobId)) return json({ ok: false, error: 'bad job id' }, 400);
+    const r = await getPaired(env, jobId);
+    if (!r) return json({ ok: false, error: 'unknown job — request /subtitles/:type/:id.json first' }, 404);
+    return json(r.body, r.status);
+  }
+
   // ── API: search (BUG #2 fix — server-side User-Agent) ──
   if (p === '/api/search' && request.method === 'GET') {
     const imdb = url.searchParams.get('imdb') || '';
@@ -614,10 +257,10 @@ async function handleRequest(request, env) {
     const season = Math.max(0, Math.min(999, Number(url.searchParams.get('season') || 0) || 0));
     const episode = Math.max(0, Math.min(9999, Number(url.searchParams.get('episode') || 0) || 0));
     const titleHint = String(url.searchParams.get('title') || '').slice(0, 200);
-    const apiKey = request.headers.get('X-SubDL-Key') || '';
+    const apiKey = request.headers.get('X-SubDL-Key') || String((env && env.SUBDL_API_KEY) || '');
     const failed = [];
     const settled = await Promise.all([
-      openSubsSearch(imdb, season, episode, null, ['sin', 'eng']).catch(() => { failed.push('opensubtitles'); return []; }),
+      openSubsSearch(imdb, season, episode, null, ['sin', 'eng'], env).catch(() => { failed.push('opensubtitles'); return []; }),
       subdlSearch(imdb, season, episode, null, apiKey).catch(() => { failed.push('subdl'); return []; }),
       pirateLkSearch(imdb, titleHint).catch(() => { failed.push('piratelk'); return []; }),
     ]);
@@ -685,7 +328,8 @@ async function handleRequest(request, env) {
         if (new TextEncoder().encode(source.text).length > MAX_UNCOMPRESSED_BYTES) return json({ ok: false, error: 'subtitle too large' }, 413);
         clean = toCleanSrt(source.text);
       } else {
-        clean = await bytesToSubtitle(source.bytes);
+        if (source.bytes.length > MAX_UNCOMPRESSED_BYTES) return json({ ok: false, error: 'upload too large (5 MB max)' }, 413);
+        clean = toCleanSrt(new TextDecoder('utf-8', { fatal: false }).decode((await decompressAny(source.bytes)).bytes));
       }
     } catch (e) {
       const msg = String(e && e.message ? e.message : e);
@@ -715,28 +359,4 @@ async function handleRequest(request, env) {
 // worker entry point (wrangler) + test exports (node)
 export default {
   fetch: (request, env, ctx) => handleRequest(request, env, ctx),
-};
-
-/**
- * Runtime limits + the provider allowlist, as a FUNCTION rather than exported constants:
- * a module Worker may only export functions / handlers, so `export const MAX_…` makes workerd
- * throw "Incorrect type for map entry … is not of type 'function or ExportedHandler'".
- * (Caught by `wrangler dev`; `wrangler deploy --dry-run` does NOT catch it.)
- */
-function limits() {
-  return {
-    maxPublishBytes: MAX_PUBLISH_BYTES,
-    maxUncompressedBytes: MAX_UNCOMPRESSED_BYTES,
-    maxUpstreamBytes: MAX_UPSTREAM_BYTES,
-    tokenLength: TOKEN_LEN,
-    ttlSeconds: TTL_SECONDS,
-    allowedHosts: DEFAULT_ALLOWED_HOSTS.slice(),
-  };
-}
-
-export {
-  handleRequest, publishSrt, getSrt, hasStorage, isValidToken, toCleanSrt, parseSrtCues, reassembleSrt,
-  isGzip, isZip, zipEntries, pickBestEntry, entryRank, isSubtitleEntry, unzipBest, decompressAny,
-  sha256Hex, catalogRoutes, openSubsSearch, subdlSearch, pirateLkSearch, fetchUpstreamSub,
-  assertSafeUpstreamUrl, isPrivateHost, hostAllowed, safeFetchBytes, readStreamCapped, limits,
 };

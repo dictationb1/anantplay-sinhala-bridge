@@ -30,8 +30,11 @@ jobs:
 
       - name: Syntax gates
         run: |
+          node --check worker/src/lib.js
+          node --check worker/src/pipeline.js
           node --check worker/src/index.js
           node --check bridge-ui/public/app.js
+          node --check lab/verify_worker_e2e.mjs
           python3 -m py_compile local-server/server.py
 
       - name: Worker tests (real .srt 200, catalogs, gz/zip, dedupe)
@@ -39,6 +42,9 @@ jobs:
 
       - name: Fixture tests (shipped synthetic Sinhala fixtures)
         run: node tests/fixtures.test.js
+
+      - name: Pipeline v3 tests (resolve, human subs, Gemini job, paired cues, 202)
+        run: node tests/pipeline.test.js
 
       - name: Security regression tests (SSRF, zip-bomb, XSS surface, payload caps)
         run: node tests/security.test.js

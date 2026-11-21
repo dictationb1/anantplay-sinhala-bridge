@@ -1,8 +1,8 @@
 {
   "name": "anantplay-si-subs-bridge",
-  "version": "2.1.0",
+  "version": "3.0.0",
   "private": true,
-  "description": "Real-HTTP .srt delivery bridge for AnantPlay Sinhala subtitles (Cloudflare Worker + LAN local server)",
+  "description": "Real-HTTP .srt delivery + zero-fork Companion API for AnantPlay Sinhala subtitles (Cloudflare Worker + LAN local server)",
   "main": "worker/src/index.js",
   "type": "module",
   "engines": {
@@ -13,8 +13,11 @@
     "test:worker": "node tests/worker.test.js",
     "test:fixtures": "node tests/fixtures.test.js",
     "test:security": "node tests/security.test.js",
+    "test:pipeline": "node tests/pipeline.test.js",
     "test:local": "python3 -m unittest discover -s tests -p 'local_server_test.py' -v",
-    "syntax": "node --check worker/src/index.js && node --check bridge-ui/public/app.js && python3 -m py_compile local-server/server.py",
+    "lab": "node lab/verify_worker_e2e.mjs",
+    "lab:remote": "node lab/verify_worker_e2e.mjs --target https://anantplay-si-subs-bridge.techworldlk.workers.dev",
+    "syntax": "node --check worker/src/lib.js && node --check worker/src/pipeline.js && node --check worker/src/index.js && node --check bridge-ui/public/app.js && node --check lab/verify_worker_e2e.mjs && python3 -m py_compile local-server/server.py",
     "deploy:dry": "wrangler deploy --dry-run"
   },
   "devDependencies": {

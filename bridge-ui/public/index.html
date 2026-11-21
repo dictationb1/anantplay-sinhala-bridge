@@ -3,120 +3,114 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>සිංහල උපසිරැසි පාලම · Sinhala Subtitle Bridge (AnantPlay)</title>
+<title>සිංහල උපසිරැසි පාලම · Sinhala Subtitle Bridge v3</title>
 <link rel="stylesheet" href="/style.css">
 </head>
 <body>
 <header>
   <h1>සිංහල උපසිරැසි පාලම</h1>
-  <p class="sub">Sinhala Subtitle Bridge — real <code>.srt</code> URLs for AnantPlay's native player</p>
-  <p class="sub">AnantPlay → Settings → Add source → paste this page's address. Or open it through a Title Link deeplink.</p>
+  <p class="sub">Sinhala Subtitle Bridge v3 — the zero-fork engine behind the AnantPlay SI Companion</p>
+  <nav id="tabs" aria-label="sections">
+    <button id="tabStatus" class="tab active" type="button">තත්ත්වය · Status</button>
+    <button id="tabManual" class="tab" type="button">අතින් · Manual / Emergency</button>
+  </nav>
 </header>
 
-<!-- ── deeplink auto-fill panel (BUG #3) ─────────────────────────────────── -->
-<section id="pick" class="card">
-  <h2>1 · චිත්‍රපටිය / කථාංගය තෝරන්න (Pick the title)</h2>
-  <p class="hint">AnantPlay Title Link එකකින් (deeplink) ආවොත් මෙතන අතින් පිරවීම අවශ්‍ය නැහැ — පිටුවම ස්වයංක්‍රීයව පුරවයි.</p>
-  <div class="grid">
-    <label>වර්ගයේ (Type)
-      <select id="type">
-        <option value="movie">චිත්‍රපටිය (Movie)</option>
-        <option value="tv" selected>ටීවී කථාව (TV series)</option>
-      </select>
-    </label>
-    <label>IMDb <input id="imdb" placeholder="tt1234567" inputmode="text" autocomplete="off"></label>
-    <label>TMDB <input id="tmdb" placeholder="12345" inputmode="numeric" autocomplete="off"></label>
-    <label>සමය (Season) <input id="season" type="number" min="1" value="1"></label>
-    <label>කථාංගයය (Episode) <input id="episode" type="number" min="1" value="1"></label>
-    <label>නම (Title) <input id="title" placeholder="e.g. Dark" autocomplete="off"></label>
-  </div>
-  <div class="row">
-    <button id="btnResolve" class="primary">Cinemeta සිට සොයන්න (Resolve)</button>
-    <button id="btnSearch">සිංහල උපසිරැසි සොයන්න (Search subs)</button>
-  </div>
-  <p id="resolveMsg" class="msg" role="status"></p>
-</section>
+<!-- ── Tab 1: Status & Secret Verification ─────────────────────────────── -->
+<main id="statusPane" class="pane">
+  <section class="card">
+    <h2>Worker තත්ත්වය · Worker status</h2>
+    <dl id="statusList" class="kv"></dl>
+    <p id="statusMsg" class="msg" role="status"></p>
+  </section>
 
-<!-- ── search results ────────────────────────────────────────────────────── -->
-<section id="results" class="card" hidden>
-  <h2>2 · ප්‍රතිඵල (Results)</h2>
-  <div id="resultList" class="list" role="listbox" aria-label="subtitle results"></div>
-  <p class="hint">සෑම පේළියක්ම: provider · භාෂාව · release · [Upload කරන්න → real .srt URL ලබාගන්න]</p>
-  <p id="searchMsg" class="msg" role="status"></p>
-</section>
-
-<!-- ── translate ──────────────────────────────────────────────────────────── -->
-<section id="translate" class="card">
-  <h2>3 · EN → සිංහල පරිවර්තනය (Gemini translate)</h2>
-  <p class="hint">දර්ශකයක් (cue) පේළි පිළිවෙලම තබා, 200–300 පේළි කාණ්ඩ වශයෙන්, නොමිලේ Gemini key එකකින්.</p>
-  <div class="row">
-    <button id="btnTranslate" class="primary">පරිවර්තනය කරන්න (Translate loaded .srt)</button>
-  </div>
-  <label class="keyrow">Gemini API key (නොමිලේ — aistudio.google.com)
-    <input id="geminiKey" type="password" placeholder="AIza…" autocomplete="off">
-  </label>
-  <label class="keyrow">Gemini model (default <code>gemini-flash-latest</code>)
-    <input id="model" type="text" placeholder="gemini-flash-latest" autocomplete="off" spellcheck="false">
-  </label>
-  <label class="keyrow">SubDL key (අකමාතර නැත — subdl.com)
-    <input id="subdlKey" type="password" placeholder="optional" autocomplete="off">
-  </label>
-  <p class="hint">Keys ඔබේ උපාංගයේ <code>localStorage</code> තුළ පමණක් තබා ගනී — hardcode වන්නේ නැහැ, log වන්නේ නැහැ. Browser data clear කළොත් මැකේ.</p>
-  <p id="translateMsg" class="msg" role="status"></p>
-</section>
-
-<!-- ── upload ─────────────────────────────────────────────────────────────── -->
-<section id="upload" class="card">
-  <h2>4 · අතින් බාගත කළ .srt / .zip Upload කරන්න</h2>
-  <p class="hint">Baiscope / Zoom වලින් බාගත කළ සිංහල .srt හෝ .zip එකක් — මෙතනින් Upload කරන්න: real <code>/sub/&lt;token&gt;.srt</code> URL එකක් ලැබේ.</p>
-  <input id="fileInput" type="file" accept=".srt,.vtt,.zip,.gz" aria-label="subtitle file">
-  <button id="btnUpload">Upload කරන්න (Publish)</button>
-  <p id="uploadMsg" class="msg" role="status"></p>
-</section>
-
-<!-- ── the REAL .srt result (the whole point) ─────────────────────────────── -->
-<section id="delivered" class="card ok" hidden>
-  <h2>✔ ඔබේ උපසිරැසි URL එක ලැබුණා (real HTTP .srt)</h2>
-  <p class="hint">මෙම URL එක HTTP 200 එකකින් එන ඇත්ත .srt ගොනුවක් — AnantPlay හි native player එකට කෙලින්ම වැඩ කරයි.</p>
-  <div class="row"><a id="srtLink" class="srtlink" href="#" target="_blank" rel="noopener"></a></div>
-  <div class="row"><button id="btnFetchIt" class="primary">URL එක fetch කරන්න (Sniffer එකට පෙන්වන්න)</button>
-  <button id="btnCopy">URL copy කරන්න</button></div>
-  <p id="deliveredMsg" class="msg" role="status"></p>
-</section>
-
-<!-- ── stream handoff (BUG #3 mode 1/2/3) ─────────────────────────────────── -->
-<section id="handoff" class="card">
-  <h2>5 · වීඩියෝ ධාරාව (stream) අතහැරලා දෙන්න (Stream handoff)</h2>
-
-  <div class="mode">
-    <h3>Mode 1 · Direct .m3u8 / .mp4 URL</h3>
-    <div class="row">
-      <input id="streamUrl" class="grow" placeholder="https://…/master.m3u8" inputmode="url" autocomplete="off">
-      <button id="btnPlayStream" class="primary">AnantPlay එකට දෙන්න (Hand off)</button>
+  <section class="card">
+    <h2>ක්ෂණික පරීක්ෂණය · Quick verification (also proves the Gemini secret works)</h2>
+    <p class="hint">Type any movie or series name — or paste an IMDb id. The worker resolves it (Cinemeta),
+      looks for human Sinhala subs first, and only then starts a Gemini Flash EN→SI translation.
+      The Companion app does all of this by itself; this box just proves the backend is alive.</p>
+    <div class="grid">
+      <label>නම / IMDb (Title or IMDb id)
+        <input id="qTitle" placeholder="e.g. Clayface  ·  tt34890576" autocomplete="off">
+      </label>
+      <label>වර්ගය (Type)
+        <select id="qType">
+          <option value="movie" selected>චිත්‍රපටිය (Movie)</option>
+          <option value="tv">ටීවී කථාව (Series)</option>
+        </select>
+      </label>
+      <label>සමය (Season) <input id="qSeason" type="number" min="1" inputmode="numeric"></label>
+      <label>කථාංගය (Episode) <input id="qEpisode" type="number" min="1" inputmode="numeric"></label>
     </div>
     <div class="row">
-      <button id="btnMuxDemo" class="ghost">🧪 Mux public HLS demo (1-click test)</button>
+      <button id="btnTest" class="primary" type="button">පරීක්ෂා කරන්න · Verify</button>
     </div>
-  </div>
+    <div id="testOut" class="result" hidden>
+      <p id="testTitle" class="line"></p>
+      <div id="testBar" class="bar" hidden><div id="testFill" class="fill"></div></div>
+      <p id="testStatus" class="line" role="status"></p>
+      <ul id="testLinks" class="list"></ul>
+    </div>
+    <p id="testMsg" class="msg" role="status"></p>
+  </section>
 
-  <div class="mode">
-    <h3>Mode 2 · Embed player URL (iframe)</h3>
-    <p class="hint">ඔබේම player URL template එකක් (saved in localStorage) — කිසිම copyrighted URL එකක් hardcode වෙලා නැහැ. <code>{STREAM}</code> කියන තැන stream URL එක බහාලයි. AnantPlay හි Sniffer එක iframe ඇතුළේ requests ද අහගන්නවා (shouldInterceptRequest). subtitle URL එක කලින් fetch කරලා තියෙනවා නම් මෙය අතිශය ලේඛනයකින් වැඩ කරයි.</p>
+  <section class="card">
+    <h2>Companion යෙදුම · The companion app</h2>
+    <p class="hint">The standalone <code>anantplay-si-companion</code> Android app reads the player of the
+      official, unmodified AnantPlay APK through accessibility, then locks each English cue it shows to
+      the paired Sinhala cue from <code>/api/paired/&lt;jobId&gt;.json</code> — frame-exact, offline after
+      the first fetch, zero typing. Its Worker URL defaults to this origin.</p>
+  </section>
+</main>
+
+<!-- ── Tab 2: Manual / Emergency ────────────────────────────────────────── -->
+<main id="manualPane" class="pane" hidden>
+  <section class="card">
+    <h2>යතුරු · Optional keys (only if the worker secrets are NOT set)</h2>
+    <p class="hint">Prefer the worker secrets (<code>wrangler secret put GEMINI_API_KEY</code> /
+      <code>wrangler secret put SUBDL_API_KEY</code>) — nothing is then typed on any phone. The fields
+      below are the emergency fallback: they are sent as request headers and kept only in this
+      browser's localStorage.</p>
+    <div class="grid">
+      <label>Gemini API key <input id="optGeminiKey" type="password" placeholder="AIza…" autocomplete="off"></label>
+      <label>Gemini model
+        <input id="optModel" placeholder="gemini-flash-latest" autocomplete="off">
+      </label>
+      <label>SubDL API key <input id="optSubdlKey" type="password" placeholder="optional" autocomplete="off"></label>
+    </div>
+    <div class="row"><button id="btnSaveKeys" type="button">සුරකින්න · Save</button></div>
+    <p id="keysMsg" class="msg" role="status"></p>
+  </section>
+
+  <section class="card">
+    <h2>අතින් උපසිරැසි ප්‍රකාශය · Publish a local .srt / .zip / .gz</h2>
+    <p class="hint">Downloaded a Baiscope / Zoom / PirateLK file by hand? Publish it here and give the
+      real <code>.srt</code> URL to AnantPlay (player → Subtitles → search) or to the Companion's
+      emergency loader. The file is validated client-side first (cue count + timestamps must survive
+      the round-trip) and is capped at 2 MB.</p>
     <div class="row">
-      <input id="embedTemplate" class="grow" placeholder="https://player.example.com/?src={STREAM}" inputmode="url" autocomplete="off">
-      <button id="btnEmbed">iframe එක load කරන්න</button>
+      <input id="fileIn" type="file" accept=".srt,.vtt,.zip,.gz">
+      <button id="btnUpload" class="primary" type="button">ප්‍රකාශය · Publish</button>
     </div>
-    <iframe id="embedFrame" title="embedded player" hidden></iframe>
-  </div>
+    <p id="uploadMsg" class="msg" role="status"></p>
+    <ul id="uploadLinks" class="list"></ul>
+  </section>
 
-  <div class="mode">
-    <h3>Mode 3 · Local .srt upload</h3>
-    <p class="hint">ඉහත 4 වන කොටස (Upload) — Baiscope වලින් බාගත කළ .srt එක upload කරලා real URL එකක් ලබාගන්න.</p>
-  </div>
-</section>
+  <section class="card">
+    <h2>API · Endpoints (for power users and the Companion)</h2>
+    <ul class="api">
+      <li><code>GET /api/resolve?title=Clayface&amp;type=movie</code></li>
+      <li><code>GET /subtitles/movie/tt34890576.json?title=Clayface</code></li>
+      <li><code>GET /api/paired/movie:tt34890576:0:0.json</code></li>
+      <li><code>GET /sub/&lt;token&gt;.srt</code> <span>(202 with progress while translating)</span></li>
+      <li><code>GET /api/status</code> · <code>GET /health</code></li>
+    </ul>
+  </section>
+</main>
 
 <footer>
-  <p>AnantPlay Sinhala Subtitle Bridge v2 · real-HTTP .srt delivery · zero fork · <a href="/index.json">index.json</a> · <a href="/sites.json">sites.json</a> · <a href="/deeplinks.json">deeplinks.json</a></p>
+  <p class="hint">AnantPlay stays 100% official and unmodified — this bridge and the companion app are
+    separate, additive tools. <span id="ver"></span></p>
 </footer>
 
 <script src="/app.js"></script>
